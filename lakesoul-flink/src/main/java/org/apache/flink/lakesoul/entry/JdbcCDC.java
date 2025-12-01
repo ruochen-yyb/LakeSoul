@@ -100,7 +100,19 @@ public class JdbcCDC {
         conf.set(WAREHOUSE_PATH, databasePrefixPath);
         conf.set(SERVER_TIME_ZONE, serverTimezone);
         conf.set(SOURCE_DB_TYPE,dbType);
-
+        // naming overrides
+        if (parameter.has(LakeSoulSinkOptions.NAMING_ENABLE.key())) {
+            conf.set(LakeSoulSinkOptions.NAMING_ENABLE, Boolean.parseBoolean(parameter.get(LakeSoulSinkOptions.NAMING_ENABLE.key())));
+        }
+        if (parameter.has(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE.key())) {
+            conf.set(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE, parameter.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE.key()));
+        }
+        if (parameter.has(LakeSoulSinkOptions.NAMING_TABLE_FORMAT.key())) {
+            conf.set(LakeSoulSinkOptions.NAMING_TABLE_FORMAT, parameter.get(LakeSoulSinkOptions.NAMING_TABLE_FORMAT.key()));
+        }
+        if (parameter.has(LakeSoulSinkOptions.NAMING_CASE.key())) {
+            conf.set(LakeSoulSinkOptions.NAMING_CASE, parameter.get(LakeSoulSinkOptions.NAMING_CASE.key()));
+        }
         // parameters for mutil tables dml sink
         conf.set(LakeSoulSinkOptions.USE_CDC, true);
         conf.set(LakeSoulSinkOptions.isMultiTableSource, true);
@@ -165,7 +177,8 @@ public class JdbcCDC {
                 .username(userName)
                 .password(passWord);
         sourceBuilder.deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert,
-                conf.getString(WAREHOUSE_PATH)));
+                // conf.getString(WAREHOUSE_PATH)));
+                conf.getString(WAREHOUSE_PATH), conf));
         Properties jdbcProperties = new Properties();
         jdbcProperties.put("allowPublicKeyRetrieval", "true");
         jdbcProperties.put("useSSL", "false");
@@ -173,8 +186,12 @@ public class JdbcCDC {
         MySqlSource<BinarySourceRecord> mySqlSource = sourceBuilder.build();
 
         NameSpaceManager manager = new NameSpaceManager();
-        manager.importOrSyncLakeSoulNamespace(dbName);
-
+        // manager.importOrSyncLakeSoulNamespace(dbName);
+        if (conf.getBoolean(LakeSoulSinkOptions.NAMING_ENABLE) && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null) {
+            manager.importOrSyncLakeSoulNamespace(conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE));
+        } else {
+            manager.importOrSyncLakeSoulNamespace(dbName);
+        }
         LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
         context.env = env;
         context.conf = (Configuration) env.getConfiguration();
@@ -201,12 +218,16 @@ public class JdbcCDC {
                 .decodingPluginName(pluginName)
                 .splitSize(splitSize)
                 .slotName(slotName)
-                .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH)))
+                .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH), conf))
                 .build();
 
         NameSpaceManager manager = new NameSpaceManager();
-        for (String schema : schemaList) {
-            manager.importOrSyncLakeSoulNamespace(schema);
+        if (conf.getBoolean(LakeSoulSinkOptions.NAMING_ENABLE) && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null) {
+            manager.importOrSyncLakeSoulNamespace(conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE));
+        } else {
+            for (String schema : schemaList) {
+                manager.importOrSyncLakeSoulNamespace(schema);
+            }
         }
         LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
         context.env = env;
@@ -236,7 +257,7 @@ public class JdbcCDC {
                         .username(userName)
                         .serverTimeZone(serverTimezone)
                         .password(passWord)
-                        .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH)))
+                        .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH), conf))
                         .includeSchemaChanges(true) // output the schema changes as well
                         .startupOptions(StartupOptions.initial())
                         .debeziumProperties(debeziumProperties)
@@ -244,7 +265,13 @@ public class JdbcCDC {
                         .build();
 
         NameSpaceManager manager = new NameSpaceManager();
-        for (String schema : schemaList) {
+        if (conf.getBoolean(LakeSoulSinkOptions.NAMING_ENABLE) && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null) {
+            manager.importOrSyncLakeSoulNamespace(conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE));
+        } else {
+            for (String schema : schemaList) {
+                manager.importOrSyncLakeSoulNamespace(schema);
+            }
+        }
             manager.importOrSyncLakeSoulNamespace(schema);
         }
 
@@ -270,11 +297,15 @@ public class JdbcCDC {
                         .tableList(tableList)
                         .username(userName)
                         .password(passWord)
-                        .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH)))
+                        .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH), conf))
                         .startupOptions(StartupOptions.initial())
                         .build();
         NameSpaceManager manager = new NameSpaceManager();
-        manager.importOrSyncLakeSoulNamespace(dbName);
+        if (conf.getBoolean(LakeSoulSinkOptions.NAMING_ENABLE) && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null) {
+            manager.importOrSyncLakeSoulNamespace(conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE));
+        } else {
+            manager.importOrSyncLakeSoulNamespace(dbName);
+        }
         LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
         context.env = env;
         context.conf = (Configuration) env.getConfiguration();
@@ -299,10 +330,14 @@ public class JdbcCDC {
                         .batchSize(batchSize)
                         .username(userName)
                         .password(passWord)
-                        .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH)))
+                        .deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH), conf))
                         .build();
         NameSpaceManager manager = new NameSpaceManager();
-        manager.importOrSyncLakeSoulNamespace(dbName);
+        if (conf.getBoolean(LakeSoulSinkOptions.NAMING_ENABLE) && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null) {
+            manager.importOrSyncLakeSoulNamespace(conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE));
+        } else {
+            manager.importOrSyncLakeSoulNamespace(dbName);
+        }
         LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
         context.env = env;
         context.conf = (Configuration) env.getConfiguration();

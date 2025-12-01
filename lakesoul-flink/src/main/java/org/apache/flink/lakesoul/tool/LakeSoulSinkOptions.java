@@ -236,6 +236,31 @@ public class  LakeSoulSinkOptions {
             .longType()
             .defaultValue(Long.MAX_VALUE)
             .withDescription("limit io read num");
+    // Naming customization for CDC multi-table sink
+    public static final ConfigOption<Boolean> NAMING_ENABLE = ConfigOptions
+            .key("naming.enable")
+            .booleanType()
+            .defaultValue(false)
+            .withDescription("Enable custom naming for target namespace and table name");
+
+    public static final ConfigOption<String> NAMING_TARGET_NAMESPACE = ConfigOptions
+            .key("naming.target_namespace")
+            .stringType()
+            .noDefaultValue()
+            .withDescription("Target namespace (database) for LakeSoul tables when naming.enable=true");
+
+    public static final ConfigOption<String> NAMING_TABLE_FORMAT = ConfigOptions
+            .key("naming.table_format")
+            .stringType()
+            .noDefaultValue()
+            .withDescription("Target table name format, supports placeholders {db} and {table}");
+
+    public static final ConfigOption<String> NAMING_CASE = ConfigOptions
+            .key("naming.case")
+            .stringType()
+            .defaultValue("preserve")
+            .withDescription("Case transform for rendered table name: preserve|lower|upper");
+
 }
 
 

@@ -67,6 +67,16 @@ public class BinarySourceRecord {
     public static BinarySourceRecord fromMysqlSourceRecord(SourceRecord sourceRecord,
                                                            LakeSoulRecordConvert convert,
                                                            String basePath) throws Exception {
+                return fromMysqlSourceRecord(sourceRecord, convert, basePath, false, null, null, "preserve");
+    }
+
+    public static BinarySourceRecord fromMysqlSourceRecord(SourceRecord sourceRecord,
+                                                           LakeSoulRecordConvert convert,
+                                                           String basePath,
+                                                           boolean namingEnabled,
+                                                           String targetNamespace,
+                                                           String tableFormat,
+                                                           String namingCase) throws Exception {
         Schema keySchema = sourceRecord.keySchema();
         TableId tableId = new TableId(io.debezium.relational.TableId.parse(sourceRecord.topic()).toLowercase());
         boolean isDDL = "io.debezium.connector.mysql.SchemaChangeKey".equalsIgnoreCase(keySchema.name());
@@ -103,15 +113,38 @@ public class BinarySourceRecord {
             }
             long sortField = (binlogFileIndex << 32) + binlogPosition;
             LakeSoulRowDataWrapper data = convert.toLakeSoulDataType(valueSchema, value, tableId, tsMs, sortField);
-            String tablePath;
-            if (tableId.schema() == null) {
-                tablePath = new Path(new Path(basePath, tableId.catalog()), tableId.table()).toString();
-            } else {
-                tablePath = new Path(new Path(basePath, tableId.schema()), tableId.table()).toString();
+            
+            // Resolve namespace(db) and table name with optional naming rules
+            String sourceDb = tableId.schema() == null ? tableId.catalog() : tableId.schema();
+            String effectiveNamespace = (namingEnabled && targetNamespace != null && !targetNamespace.isEmpty())
+                    ? targetNamespace
+                    : sourceDb;
+            String effectiveTable = tableId.table();
+            if (namingEnabled && tableFormat != null && !tableFormat.isEmpty()) {
+                effectiveTable = tableFormat.replace("{db}", sourceDb == null ? "" : sourceDb)
+                        .replace("{table}", tableId.table());
+                if ("lower".equalsIgnoreCase(namingCase)) {
+                    effectiveTable = effectiveTable.toLowerCase();
+                } else if ("upper".equalsIgnoreCase(namingCase)) {
+                    effectiveTable = effectiveTable.toUpperCase();
+                }
             }
-            return new BinarySourceRecord(sourceRecord.topic(), primaryKeys, tableId,
+
+            // Build table path
+            String tablePath = new Path(new Path(basePath, effectiveNamespace), effectiveTable).toString();
+
+            // Adjust TableId for downstream identity consistency
+            TableId adjustedId;
+            if (tableId.schema() == null) {
+                adjustedId = new TableId(effectiveNamespace, null, effectiveTable);
+            } else {
+                adjustedId = new TableId(tableId.catalog(), effectiveNamespace, effectiveTable);
+            }
+
+            return new BinarySourceRecord(sourceRecord.topic(), primaryKeys, adjustedId,
                     FlinkUtil.makeQualifiedPath(tablePath).toString(),
                     Collections.emptyList(), false, data, null);
+   
         }
     }
 
