@@ -272,8 +272,6 @@ public class JdbcCDC {
                 manager.importOrSyncLakeSoulNamespace(schema);
             }
         }
-            manager.importOrSyncLakeSoulNamespace(schema);
-        }
 
         LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
         context.env = env;
