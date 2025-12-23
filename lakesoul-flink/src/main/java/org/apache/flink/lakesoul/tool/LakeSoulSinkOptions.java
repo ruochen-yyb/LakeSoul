@@ -189,16 +189,40 @@ public class  LakeSoulSinkOptions {
             .stringType()
             .defaultValue("")
             .withDescription("list tables of a schema");
+
     public static final ConfigOption<String> SOURCE_DB_SLOT_NAME = ConfigOptions
             .key("source_db.slot_name")
             .stringType()
             .defaultValue("flink")
             .withDescription("source db slot name");
+
     public static final ConfigOption<Integer> SOURCE_DB_SPLIT_SIZE = ConfigOptions
             .key("source_db.splitSize")
             .intType()
             .defaultValue(1024)
             .withDescription("The split size (number of rows) of table snapshot, captured tables are split into multiple splits when read the snapshot of table.");
+
+    /**
+     * 是否整库/整 schema 捕获所有表（目前主要用于 Postgres）。
+     * - 当为 true 时，如果 source_db.schemaList 已配置，则会尝试发现这些 schema 下的所有用户表；
+     * - 该开关仅控制捕获表列表的构造方式，不影响下游命名规则。
+     */
+    public static final ConfigOption<Boolean> SOURCE_DB_CAPTURE_ALL_TABLES = ConfigOptions
+            .key("source_db.capture_all_tables")
+            .booleanType()
+            .defaultValue(false)
+            .withDescription("If true, capture all tables under the given schemaList for supported db types (initially postgres).");
+
+    /**
+     * 是否自动发现新建表（预留开关，当前不强制实现动态表发现逻辑）。
+     * - 默认 false：仅在作业启动阶段扫描一次元数据，后续如需同步新增表，需要重启作业；
+     * - 未来如需支持 Postgres 新表自动发现，可在 CDC 层或调度层结合此开关扩展逻辑。
+     */
+    public static final ConfigOption<Boolean> SOURCE_DB_AUTO_DISCOVER_NEW_TABLES = ConfigOptions
+            .key("source_db.auto_discover_new_tables")
+            .booleanType()
+            .defaultValue(false)
+            .withDescription("If true, periodically discover and capture newly created tables (initially only for postgres if supported).");
 
     //for pg
     public static final ConfigOption<String> PLUGIN_NAME = ConfigOptions

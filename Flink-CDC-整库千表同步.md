@@ -70,7 +70,53 @@ flink run -c org.apache.flink.lakesoul.entry.JdbcCDC $LAKESOUL_FLINK_JAR \
   --naming.case preserve
 ```
 
-MySQL 示例（整库）：
+## Postgres 整库/整 schema 模式（新增）
+
+- **目标**：对于 Postgres 源端，支持仅指定库名与 `schemaList`，无需逐一维护 `schema_tables`，由作业在启动时自动发现 schema 下所有用户表并同步入湖。
+- **关键参数**：
+  - `--source_db.capture_all_tables true|false`：是否开启整库/整 schema 表自动发现（目前仅对 `postgres` 生效），默认 `false`。
+  - `--source_db.schemaList "<schema1,schema2,...>"`：指定需要同步的 schema 列表（整库模式下为必填）。
+  - `--source_db.schema_tables`：在 `capture_all_tables=false` 时仍然生效，用于显式白名单；在 `capture_all_tables=true` 时会被忽略。
+
+### 示例：Postgres 整库（按 schemaList 捕获全部表）
+
+```bash
+flink run -c org.apache.flink.lakesoul.entry.JdbcCDC $LAKESOUL_FLINK_JAR \
+  --source_db.db_type "postgres" \
+  --source_db.host "<host>" \
+  --source_db.port 5432 \
+  --source_db.db_name "<database>" \
+  --source_db.user "<user>" \
+  --source_db.password "<pass>" \
+  --source_db.schemaList "public,dim" \
+  --source_db.capture_all_tables true \
+  --source_db.slot_name flinkcdc \
+  --pluginName "pgoutput" \
+  --source.parallelism 4 \
+  --sink.parallelism 4 \
+  --job.checkpoint_interval 60000 \
+  --warehouse_path s3://<bucket>/lakesoul/flink/data \
+  --flink.checkpoint s3://<bucket>/lakesoul/flink/checkpoints \
+  --flink.savepoint  s3://<bucket>/lakesoul/flink/savepoints \
+  --naming.enable true \
+  --naming.target_namespace ods_new \
+  --naming.table_format ods_{db}_plantA_{table} \
+  --naming.case preserve
+```
+
+### 行为说明（Postgres）
+
+- 当 `--source_db.db_type=postgres` 且：
+  - `--source_db.capture_all_tables=true` 时：
+    - 作业启动前会基于 `schemaList` 使用 JDBC 查询 `information_schema.tables`；
+    - 自动发现所有 `BASE TABLE` 类型的表，组装为 `schema.table` 形式的列表传入 CDC Source；
+    - 若未发现任何表，将以明确异常失败，提示检查 `schemaList` 与库内元数据。
+  - `--source_db.capture_all_tables=false`（默认）时：
+    - 保持原有行为：必须显式提供 `--source_db.schema_tables "schema.tbl_a,schema.tbl_b,..."`；
+    - 若缺失或为空，将抛出异常，提示用户补齐参数或开启整库模式。
+- 对 Oracle / SQLServer / MongoDB 行为不变，仍按原有 `schema_tables` 或 `collectionList` 机制工作。
+
+## MySQL 示例（整库）：
 
 ```bash
 flink run -c org.apache.flink.lakesoul.entry.JdbcCDC $LAKESOUL_FLINK_JAR \

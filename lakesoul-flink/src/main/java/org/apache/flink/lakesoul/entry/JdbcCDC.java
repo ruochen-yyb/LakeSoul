@@ -32,6 +32,13 @@ import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 
@@ -64,15 +71,47 @@ public class JdbcCDC {
         passWord = parameter.get(SOURCE_DB_PASSWORD.key());
         host = parameter.get(SOURCE_DB_HOST.key());
         port = parameter.getInt(SOURCE_DB_PORT.key(), MysqlDBManager.DEFAULT_MYSQL_PORT);
-        //Postgres Oracle
-        if (dbType.equalsIgnoreCase("oracle") || dbType.equalsIgnoreCase("postgres") ) {
+        // Postgres / Oracle 场景公共参数解析
+        if (dbType.equalsIgnoreCase("oracle") || dbType.equalsIgnoreCase("postgres")) {
             schemaList = parameter.get(SOURCE_DB_SCHEMA_LIST.key()).split(",");
-            String[] tables = parameter.get(SOURCE_DB_SCHEMA_TABLES.key()).split(",");
+            splitSize = parameter.getInt(SOURCE_DB_SPLIT_SIZE.key(), SOURCE_DB_SPLIT_SIZE.defaultValue());
+        }
+        // Postgres 整库/整 schema 捕获模式与兼容行为
+        if (dbType.equalsIgnoreCase("postgres")) {
+            // 是否开启整库/整 schema 表自动发现功能
+            boolean captureAllTables = parameter.getBoolean(
+                    LakeSoulSinkOptions.SOURCE_DB_CAPTURE_ALL_TABLES.key(),
+                    LakeSoulSinkOptions.SOURCE_DB_CAPTURE_ALL_TABLES.defaultValue());
+            if (captureAllTables) {
+                // 开启整库模式：基于 schemaList 从 Postgres 元数据发现所有用户表
+                tableList = discoverAllTablesFromPostgres();
+            } else {
+                // 兼容旧行为：仍然要求显式提供 schema_tables 白名单
+                String rawTables = parameter.get(SOURCE_DB_SCHEMA_TABLES.key(), "").trim();
+                if (rawTables.isEmpty()) {
+                    throw new IllegalArgumentException(
+                            "Postgres CDC requires either non-empty --source_db.schema_tables "
+                                    + "or enabling --source_db.capture_all_tables=true");
+                }
+                String[] tables = rawTables.split(",");
+                tableList = new String[tables.length];
+                for (int i = 0; i < tables.length; i++) {
+                    tableList[i] = tables[i].toUpperCase();
+                }
+            }
+        }
+        // Oracle 仍然采用 schema_tables 白名单模式
+        if (dbType.equalsIgnoreCase("oracle")) {
+            String rawTables = parameter.get(SOURCE_DB_SCHEMA_TABLES.key(), "").trim();
+            if (rawTables.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Oracle CDC requires non-empty --source_db.schema_tables configuration.");
+            }
+            String[] tables = rawTables.split(",");
             tableList = new String[tables.length];
             for (int i = 0; i < tables.length; i++) {
                 tableList[i] = tables[i].toUpperCase();
             }
-            splitSize = parameter.getInt(SOURCE_DB_SPLIT_SIZE.key(), SOURCE_DB_SPLIT_SIZE.defaultValue());
         }
         if (dbType.equalsIgnoreCase("sqlserver") ){
             tableList = parameter.get(SOURCE_DB_SCHEMA_TABLES.key()).split(",");
@@ -240,6 +279,62 @@ public class JdbcCDC {
         DataStream<BinarySourceRecord> stream = builder.buildHashPartitionedCDCStream(source);
         DataStreamSink<BinarySourceRecord> dmlSink = builder.buildLakeSoulDMLSink(stream);
         env.execute("LakeSoul CDC Sink From Postgres Database " + dbName);
+    }
+
+    /**
+     * 基于当前配置的 Postgres 连接信息与 schemaList，查询 information_schema.tables，
+     * 自动发现所有用户表并构造 schema.table 形式的表名列表，用于整库/整 schema 捕获。
+     *
+     * @return 包含 schema.table 形式的表名数组
+     */
+    private static String[] discoverAllTablesFromPostgres() {
+        // 简单的 JDBC 元数据查询实现，要求 Flink 集群 classpath 中存在 Postgres JDBC Driver。
+        String jdbcUrl = String.format("jdbc:postgresql://%s:%d/%s", host, port, dbName);
+        String[] schemas = schemaList != null ? schemaList : new String[0];
+        if (schemas.length == 0) {
+            throw new IllegalArgumentException(
+                    "Postgres CDC capture_all_tables is enabled, but source_db.schemaList is empty. "
+                            + "Please configure at least one schema, e.g. --source_db.schemaList \"public\"");
+        }
+        // 构造 schema 过滤条件占位符
+        StringBuilder schemaPlaceholders = new StringBuilder();
+        for (int i = 0; i < schemas.length; i++) {
+            if (i > 0) {
+                schemaPlaceholders.append(",");
+            }
+            schemaPlaceholders.append("?");
+        }
+        String sql = "SELECT table_schema, table_name "
+                + "FROM information_schema.tables "
+                + "WHERE table_type = 'BASE TABLE' "
+                + "AND table_schema IN (" + schemaPlaceholders + ") "
+                + "ORDER BY table_schema, table_name";
+
+        List<String> tables = new ArrayList<>();
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, userName, passWord);
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            // 绑定 schema 参数
+            for (int i = 0; i < schemas.length; i++) {
+                ps.setString(i + 1, schemas[i]);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String schema = rs.getString("table_schema");
+                    String table = rs.getString("table_name");
+                    // CDC 入口内部使用 schema.table 的形式，再在后续逻辑中统一转大写/命名处理
+                    tables.add((schema + "." + table).toUpperCase());
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to discover Postgres tables for schemas "
+                    + String.join(",", schemas) + " from " + jdbcUrl, e);
+        }
+        if (tables.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "No base tables found for Postgres schemas: " + String.join(",", schemas)
+                            + ". Please check schemaList configuration and database metadata.");
+        }
+        return tables.toArray(new String[0]);
     }
 
     private static void oracleCdc(LakeSoulRecordConvert lakeSoulRecordConvert, Configuration conf, StreamExecutionEnvironment env) throws Exception {
