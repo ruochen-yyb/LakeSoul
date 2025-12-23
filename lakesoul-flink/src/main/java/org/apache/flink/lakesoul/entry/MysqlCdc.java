@@ -26,6 +26,7 @@ import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
@@ -37,109 +38,132 @@ import static org.apache.flink.lakesoul.tool.LakeSoulDDLSinkOptions.*;
 
 public class MysqlCdc {
 
-    public static void main(String[] args) throws Exception {
-        ParameterTool parameter = ParameterTool.fromArgs(args);
+        public static void main(String[] args) throws Exception {
+                ParameterTool parameter = ParameterTool.fromArgs(args);
 
-        String dbName = parameter.get(SOURCE_DB_DB_NAME.key());
-        String userName = parameter.get(SOURCE_DB_USER.key());
-        String passWord = parameter.get(SOURCE_DB_PASSWORD.key());
-        String host = parameter.get(SOURCE_DB_HOST.key());
-        int port = parameter.getInt(SOURCE_DB_PORT.key(), MysqlDBManager.DEFAULT_MYSQL_PORT);
-        String sinkDBName = parameter.get(SINK_DBNAME.key(), SINK_DBNAME.defaultValue());
-        String databasePrefixPath = parameter.get(WAREHOUSE_PATH.key());
-        String serverTimezone = parameter.get(SERVER_TIME_ZONE.key(), SERVER_TIME_ZONE.defaultValue());
-        int sourceParallelism = parameter.getInt(SOURCE_PARALLELISM.key());
-        int bucketParallelism = parameter.getInt(BUCKET_PARALLELISM.key());
-        int checkpointInterval = parameter.getInt(JOB_CHECKPOINT_INTERVAL.key(),
-                JOB_CHECKPOINT_INTERVAL.defaultValue());     //mill second
+                String dbName = parameter.get(SOURCE_DB_DB_NAME.key());
+                String userName = parameter.get(SOURCE_DB_USER.key());
+                String passWord = parameter.get(SOURCE_DB_PASSWORD.key());
+                String host = parameter.get(SOURCE_DB_HOST.key());
+                int port = parameter.getInt(SOURCE_DB_PORT.key(), MysqlDBManager.DEFAULT_MYSQL_PORT);
+                String sinkDBName = parameter.get(SINK_DBNAME.key(), SINK_DBNAME.defaultValue());
+                String databasePrefixPath = parameter.get(WAREHOUSE_PATH.key());
+                String serverTimezone = parameter.get(SERVER_TIME_ZONE.key(), SERVER_TIME_ZONE.defaultValue());
+                int sourceParallelism = parameter.getInt(SOURCE_PARALLELISM.key());
+                int bucketParallelism = parameter.getInt(BUCKET_PARALLELISM.key());
+                int checkpointInterval = parameter.getInt(JOB_CHECKPOINT_INTERVAL.key(),
+                                JOB_CHECKPOINT_INTERVAL.defaultValue()); // mill second
 
-        MysqlDBManager mysqlDBManager = new MysqlDBManager(dbName,
-                userName,
-                passWord,
-                host,
-                Integer.toString(port),
-                new HashSet<>(),
-                databasePrefixPath,
-                bucketParallelism,
-                true);
+                String tableListStr = parameter.get(SOURCE_DB_TABLE_LIST.key(), null);
 
-        mysqlDBManager.importOrSyncLakeSoulNamespace(dbName);
-        Configuration globalConfig = GlobalConfiguration.loadConfiguration();
-        String warehousePath = databasePrefixPath == null ? globalConfig.getString(WAREHOUSE_PATH.key(), null): databasePrefixPath;
-        Configuration conf = new Configuration();
+                MysqlDBManager mysqlDBManager = new MysqlDBManager(dbName,
+                                userName,
+                                passWord,
+                                host,
+                                Integer.toString(port),
+                                new HashSet<>(),
+                                databasePrefixPath,
+                                bucketParallelism,
+                                true);
 
-        // parameters for mutil tables ddl sink
-        conf.set(SOURCE_DB_DB_NAME, dbName);
-        conf.set(SOURCE_DB_USER, userName);
-        conf.set(SOURCE_DB_PASSWORD, passWord);
-        conf.set(SOURCE_DB_HOST, host);
-        conf.set(SOURCE_DB_PORT, port);
-        conf.set(WAREHOUSE_PATH, warehousePath);
-        conf.set(SERVER_TIME_ZONE, serverTimezone);
+                mysqlDBManager.importOrSyncLakeSoulNamespace(dbName);
+                Configuration globalConfig = GlobalConfiguration.loadConfiguration();
+                String warehousePath = databasePrefixPath == null ? globalConfig.getString(WAREHOUSE_PATH.key(), null)
+                                : databasePrefixPath;
+                Configuration conf = new Configuration();
 
-        // parameters for mutil tables dml sink
-        conf.set(LakeSoulSinkOptions.USE_CDC, true);
-        conf.set(LakeSoulSinkOptions.isMultiTableSource, true);
-        conf.set(LakeSoulSinkOptions.WAREHOUSE_PATH, warehousePath);
-        conf.set(LakeSoulSinkOptions.SOURCE_PARALLELISM, sourceParallelism);
-        conf.set(LakeSoulSinkOptions.BUCKET_PARALLELISM, bucketParallelism);
-        conf.set(LakeSoulSinkOptions.HASH_BUCKET_NUM, bucketParallelism);
-        conf.set(ExecutionCheckpointingOptions.ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH, true);
+                // parameters for mutil tables ddl sink
+                conf.set(SOURCE_DB_DB_NAME, dbName);
+                conf.set(SOURCE_DB_USER, userName);
+                conf.set(SOURCE_DB_PASSWORD, passWord);
+                conf.set(SOURCE_DB_HOST, host);
+                conf.set(SOURCE_DB_PORT, port);
+                conf.set(WAREHOUSE_PATH, warehousePath);
+                conf.set(SERVER_TIME_ZONE, serverTimezone);
+                if (tableListStr != null) {
+                        conf.set(SOURCE_DB_TABLE_LIST, tableListStr);
+                }
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(conf);
-        env.getConfig().registerTypeWithKryoSerializer(BinarySourceRecord.class, BinarySourceRecordSerializer.class);
+                // parameters for mutil tables dml sink
+                conf.set(LakeSoulSinkOptions.USE_CDC, true);
+                conf.set(LakeSoulSinkOptions.isMultiTableSource, true);
+                conf.set(LakeSoulSinkOptions.WAREHOUSE_PATH, warehousePath);
+                conf.set(LakeSoulSinkOptions.SOURCE_PARALLELISM, sourceParallelism);
+                conf.set(LakeSoulSinkOptions.BUCKET_PARALLELISM, bucketParallelism);
+                conf.set(LakeSoulSinkOptions.HASH_BUCKET_NUM, bucketParallelism);
+                conf.set(ExecutionCheckpointingOptions.ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH, true);
 
-        ParameterTool pt = ParameterTool.fromMap(conf.toMap());
-        env.getConfig().setGlobalJobParameters(pt);
+                StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(conf);
+                env.getConfig().registerTypeWithKryoSerializer(BinarySourceRecord.class,
+                                BinarySourceRecordSerializer.class);
 
-        env.enableCheckpointing(checkpointInterval);
-        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(4023);
+                ParameterTool pt = ParameterTool.fromMap(conf.toMap());
+                env.getConfig().setGlobalJobParameters(pt);
 
-        CheckpointingMode checkpointingMode = CheckpointingMode.EXACTLY_ONCE;
-        if (parameter.get(JOB_CHECKPOINT_MODE.key(), JOB_CHECKPOINT_MODE.defaultValue()).equals("AT_LEAST_ONCE")) {
-            checkpointingMode = CheckpointingMode.AT_LEAST_ONCE;
+                env.enableCheckpointing(checkpointInterval);
+                env.getCheckpointConfig().setMinPauseBetweenCheckpoints(4023);
+
+                CheckpointingMode checkpointingMode = CheckpointingMode.EXACTLY_ONCE;
+                if (parameter.get(JOB_CHECKPOINT_MODE.key(), JOB_CHECKPOINT_MODE.defaultValue())
+                                .equals("AT_LEAST_ONCE")) {
+                        checkpointingMode = CheckpointingMode.AT_LEAST_ONCE;
+                }
+                env.getCheckpointConfig().setTolerableCheckpointFailureNumber(5);
+                env.getCheckpointConfig().setCheckpointingMode(checkpointingMode);
+                env.getCheckpointConfig()
+                                .setExternalizedCheckpointCleanup(
+                                                CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+
+                env.getCheckpointConfig().setCheckpointStorage(parameter.get(FLINK_CHECKPOINT.key()));
+                env.setRestartStrategy(RestartStrategies.failureRateRestart(
+                                3, // max failures per interval
+                                Time.of(10, TimeUnit.MINUTES), // time interval for measuring failure rate
+                                Time.of(20, TimeUnit.SECONDS) // delay
+                ));
+
+                String[] tableList;
+                if (tableListStr == null || tableListStr.trim().isEmpty()) {
+                        tableList = new String[] { dbName + ".*" };
+                } else {
+                        tableList = Arrays.stream(tableListStr.split(","))
+                                        .map(String::trim)
+                                        .filter(s -> !s.isEmpty())
+                                        .map(t -> t.contains(".") ? t : dbName + "." + t)
+                                        .toArray(String[]::new);
+                        if (tableList.length == 0) {
+                                tableList = new String[] { dbName + ".*" };
+                        }
+                }
+
+                MySqlSourceBuilder<BinarySourceRecord> sourceBuilder = MySqlSource.<BinarySourceRecord>builder()
+                                .hostname(host)
+                                .port(port)
+                                .databaseList(dbName) // set captured database
+                                .tableList(tableList) // set captured table(s)
+                                .serverTimeZone(serverTimezone) // default -- Asia/Shanghai
+                                // .scanNewlyAddedTableEnabled(true)
+                                .username(userName)
+                                .password(passWord);
+
+                LakeSoulRecordConvert lakeSoulRecordConvert = new LakeSoulRecordConvert(conf,
+                                conf.getString(SERVER_TIME_ZONE));
+                sourceBuilder.deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert,
+                                conf.getString(WAREHOUSE_PATH), sinkDBName));
+                Properties jdbcProperties = new Properties();
+                jdbcProperties.put("allowPublicKeyRetrieval", "true");
+                jdbcProperties.put("useSSL", "false");
+                sourceBuilder.jdbcProperties(jdbcProperties);
+                MySqlSource<BinarySourceRecord> mySqlSource = sourceBuilder.build();
+
+                LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
+                context.env = env;
+                context.conf = (Configuration) env.getConfiguration();
+                LakeSoulMultiTableSinkStreamBuilder builder = new LakeSoulMultiTableSinkStreamBuilder(mySqlSource,
+                                context, lakeSoulRecordConvert);
+                DataStreamSource<BinarySourceRecord> source = builder.buildMultiTableSource("MySQL Source");
+
+                DataStream<BinarySourceRecord> stream = builder.buildHashPartitionedCDCStream(source);
+                DataStreamSink<BinarySourceRecord> dmlSink = builder.buildLakeSoulDMLSink(stream);
+                env.execute("LakeSoul CDC Sink From MySQL Database " + dbName);
         }
-        env.getCheckpointConfig().setTolerableCheckpointFailureNumber(5);
-        env.getCheckpointConfig().setCheckpointingMode(checkpointingMode);
-        env.getCheckpointConfig()
-                .setExternalizedCheckpointCleanup(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
-
-        env.getCheckpointConfig().setCheckpointStorage(parameter.get(FLINK_CHECKPOINT.key()));
-        env.setRestartStrategy(RestartStrategies.failureRateRestart(
-                3, // max failures per interval
-                Time.of(10, TimeUnit.MINUTES), //time interval for measuring failure rate
-                Time.of(20, TimeUnit.SECONDS) // delay
-        ));
-
-        MySqlSourceBuilder<BinarySourceRecord> sourceBuilder = MySqlSource.<BinarySourceRecord>builder()
-                .hostname(host)
-                .port(port)
-                .databaseList(dbName) // set captured database
-                .tableList(dbName + ".*") // set captured table
-                .serverTimeZone(serverTimezone)  // default -- Asia/Shanghai
-                //.scanNewlyAddedTableEnabled(true)
-                .username(userName)
-                .password(passWord);
-
-        LakeSoulRecordConvert lakeSoulRecordConvert = new LakeSoulRecordConvert(conf, conf.getString(SERVER_TIME_ZONE));
-        sourceBuilder.deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert,
-                conf.getString(WAREHOUSE_PATH), sinkDBName));
-        Properties jdbcProperties = new Properties();
-        jdbcProperties.put("allowPublicKeyRetrieval", "true");
-        jdbcProperties.put("useSSL", "false");
-        sourceBuilder.jdbcProperties(jdbcProperties);
-        MySqlSource<BinarySourceRecord> mySqlSource = sourceBuilder.build();
-
-        LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
-        context.env = env;
-        context.conf = (Configuration) env.getConfiguration();
-        LakeSoulMultiTableSinkStreamBuilder
-                builder =
-                new LakeSoulMultiTableSinkStreamBuilder(mySqlSource, context, lakeSoulRecordConvert);
-        DataStreamSource<BinarySourceRecord> source = builder.buildMultiTableSource("MySQL Source");
-
-        DataStream<BinarySourceRecord> stream = builder.buildHashPartitionedCDCStream(source);
-        DataStreamSink<BinarySourceRecord> dmlSink = builder.buildLakeSoulDMLSink(stream);
-        env.execute("LakeSoul CDC Sink From MySQL Database " + dbName);
-    }
 }
