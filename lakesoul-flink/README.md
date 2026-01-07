@@ -1,6 +1,7 @@
 ## LakeSoul Flink Connector 简要说明
 
 - **参数 `source_db.table.list`**
+
   - **配置项**: `source_db.table.list`
   - **类型**: 字符串
   - **作用**: 指定 MySQL CDC 任务需要捕获的表列表（仅表名或表名正则），支持逗号分隔多个规则。
@@ -15,4 +16,52 @@
     - 捕获当前库下 `special` 单表：
       - `--source_db.table.list='special'`
 
+- **参数 `sink_db_name`（目标库名 / Namespace）**
 
+  - **配置项**: `sink_db_name`
+  - **类型**: 字符串
+  - **作用**: 指定入湖目标库名（LakeSoul namespace）。
+  - **默认行为**: 不配置或为空时，使用源库名 `source_db.db_name`。
+
+- **参数 `sink_table_prefix`（目标表前缀）**
+  - **配置项**: `sink_table_prefix`
+  - **类型**: 字符串
+  - **作用**: 指定入湖目标表名前缀，入湖表名规则为 `${prefix}_${sourceTable}`（不包含源库名）。
+  - **默认行为**: 不配置时保持历史行为（表名为 `s_${sourceDb}_${sourceTable}`）；配置时启用新规则。
+  - **示例**:
+    - 以 `ods_` 作为前缀写入（例如源表 `user` → 目标表 `ods_user`）：
+      - `--sink_table_prefix='ods'`
+
+### 使用示例（MySQL 千表同步）
+
+> 下面示例仅展示关键参数，其他 Flink/Checkpoint 参数请按部署环境补齐。
+
+- **入口 1：`org.apache.flink.lakesoul.entry.MysqlCdc`**
+
+```bash
+flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink.jar \
+  --source_db.db_name=mydb \
+  --source_db.user=root \
+  --source_db.password=xxx \
+  --source_db.host=127.0.0.1 \
+  --source_db.port=3306 \
+  --warehouse_path=file:///tmp/lakesoul \
+  --source_db.table.list='user_.*,order_.*' \
+  --sink_db_name=lake_ods \
+  --sink_table_prefix=ods
+```
+
+- **入口 2：`org.apache.flink.lakesoul.entry.JdbcCDC`（db_type=mysql）**
+
+```bash
+flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink.jar \
+  --source_db.db_type=mysql \
+  --source_db.db_name=mydb \
+  --source_db.user=root \
+  --source_db.password=xxx \
+  --source_db.host=127.0.0.1 \
+  --source_db.port=3306 \
+  --warehouse_path=file:///tmp/lakesoul \
+  --sink_db_name=lake_ods \
+  --sink_table_prefix=ods
+```

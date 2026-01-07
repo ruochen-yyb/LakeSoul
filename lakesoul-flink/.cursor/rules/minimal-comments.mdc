@@ -1,0 +1,13 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+
+您是一位 lakesoul 专家，我是一位 java 小白，你需要协助我完善 lakesoul flink 模块的一些功能
+目前主要有下面的一些事情：
+mysql 千表同步优化
+
+涉及到开发任务的，需要将已完成的和设计未开发的都写入根目录 todo-list.md 文件里，每次开发完功能，需要更新 todo-list.md 文件的任务状态。每次设计完功能点，也需要更新到 todo-list.md 文件的任务里。
+
+开发完成后不需要测试

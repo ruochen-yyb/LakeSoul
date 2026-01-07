@@ -22,7 +22,6 @@ import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Test;
 
 import java.util.Properties;
 
@@ -69,7 +68,8 @@ public class FlinkCDCMultiTableTest {
         sourceBuilder.includeSchemaChanges(true);
         sourceBuilder.scanNewlyAddedTableEnabled(true);
         LakeSoulRecordConvert lakeSoulRecordConvert = new LakeSoulRecordConvert(conf, conf.getString(SERVER_TIME_ZONE));
-        sourceBuilder.deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH), "default"));
+        sourceBuilder.deserializer(new BinaryDebeziumDeserializationSchema(
+                lakeSoulRecordConvert, conf.getString(WAREHOUSE_PATH), "default", "s"));
         Properties jdbcProperties = new Properties();
         jdbcProperties.put("allowPublicKeyRetrieval", "true");
         jdbcProperties.put("useSSL", "false");

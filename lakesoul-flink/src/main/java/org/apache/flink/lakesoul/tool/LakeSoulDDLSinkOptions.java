@@ -65,4 +65,11 @@ public class LakeSoulDDLSinkOptions extends LakeSoulSinkOptions {
                         .defaultValue(null)
                         .withDescription("Database for Data into LakeSoul");
 
+        public static final ConfigOption<String> SINK_TABLE_PREFIX = ConfigOptions
+                        .key("sink_table_prefix")
+                        .stringType()
+                        .defaultValue(null)
+                        .withDescription(
+                                        "Prefix for sink table name. If set, sink table name will be `${prefix}_${sourceTable}`");
+
 }

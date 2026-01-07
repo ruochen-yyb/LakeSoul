@@ -1,0 +1,4 @@
+#NOTE: This is a Maven Resolver internal implementation file, its format can be changed without prior notice.
+#Wed Jan 07 12:36:37 CST 2026
+@default-central-https\://repo.maven.apache.org/maven2/.lastUpdated=1767760597540
+https\://repo.maven.apache.org/maven2/.error=Could not transfer artifact org.sonatype.central\:central-publishing-maven-plugin\:pom\:0.8.0 from/to central (https\://repo.maven.apache.org/maven2)\: repo.maven.apache.org\: \u57DF\u540D\u89E3\u6790\u51FA\u73B0\u6682\u65F6\u6027\u9519\u8BEF

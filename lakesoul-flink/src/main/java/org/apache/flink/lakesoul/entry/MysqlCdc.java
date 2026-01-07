@@ -47,6 +47,7 @@ public class MysqlCdc {
                 String host = parameter.get(SOURCE_DB_HOST.key());
                 int port = parameter.getInt(SOURCE_DB_PORT.key(), MysqlDBManager.DEFAULT_MYSQL_PORT);
                 String sinkDBName = parameter.get(SINK_DBNAME.key(), SINK_DBNAME.defaultValue());
+                String sinkTablePrefix = parameter.get(SINK_TABLE_PREFIX.key(), "s");
                 String databasePrefixPath = parameter.get(WAREHOUSE_PATH.key());
                 String serverTimezone = parameter.get(SERVER_TIME_ZONE.key(), SERVER_TIME_ZONE.defaultValue());
                 int sourceParallelism = parameter.getInt(SOURCE_PARALLELISM.key());
@@ -66,7 +67,8 @@ public class MysqlCdc {
                                 bucketParallelism,
                                 true);
 
-                mysqlDBManager.importOrSyncLakeSoulNamespace(dbName);
+                String targetNamespace = sinkDBName != null && !sinkDBName.trim().isEmpty() ? sinkDBName : dbName;
+                mysqlDBManager.importOrSyncLakeSoulNamespace(targetNamespace);
                 Configuration globalConfig = GlobalConfiguration.loadConfiguration();
                 String warehousePath = databasePrefixPath == null ? globalConfig.getString(WAREHOUSE_PATH.key(), null)
                                 : databasePrefixPath;
@@ -83,6 +85,7 @@ public class MysqlCdc {
                 if (tableListStr != null) {
                         conf.set(SOURCE_DB_TABLE_LIST, tableListStr);
                 }
+                conf.set(SINK_TABLE_PREFIX, sinkTablePrefix);
 
                 // parameters for mutil tables dml sink
                 conf.set(LakeSoulSinkOptions.USE_CDC, true);
@@ -148,7 +151,7 @@ public class MysqlCdc {
                 LakeSoulRecordConvert lakeSoulRecordConvert = new LakeSoulRecordConvert(conf,
                                 conf.getString(SERVER_TIME_ZONE));
                 sourceBuilder.deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert,
-                                conf.getString(WAREHOUSE_PATH), sinkDBName));
+                                conf.getString(WAREHOUSE_PATH), sinkDBName, sinkTablePrefix));
                 Properties jdbcProperties = new Properties();
                 jdbcProperties.put("allowPublicKeyRetrieval", "true");
                 jdbcProperties.put("useSSL", "false");

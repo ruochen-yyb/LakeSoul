@@ -16,17 +16,22 @@ public class BinaryDebeziumDeserializationSchema implements DebeziumDeserializat
     LakeSoulRecordConvert convert;
     String basePath;
     String sinkDBName;
+    String sinkTablePrefix;
 
-    public BinaryDebeziumDeserializationSchema(LakeSoulRecordConvert convert, String basePath, String sinkDBName) {
+    public BinaryDebeziumDeserializationSchema(LakeSoulRecordConvert convert, String basePath, String sinkDBName,
+            String sinkTablePrefix) {
         this.convert = convert;
         this.basePath = basePath;
         this.sinkDBName = sinkDBName;
+        this.sinkTablePrefix = sinkTablePrefix;
     }
 
     @Override
     public void deserialize(SourceRecord sourceRecord, Collector<BinarySourceRecord> collector) throws Exception {
-        BinarySourceRecord binarySourceRecord = BinarySourceRecord.fromMysqlSourceRecord(sourceRecord, this.convert, this.basePath, this.sinkDBName);
-        if (binarySourceRecord != null) collector.collect(binarySourceRecord);
+        BinarySourceRecord binarySourceRecord = BinarySourceRecord.fromMysqlSourceRecord(sourceRecord, this.convert,
+                this.basePath, this.sinkDBName, this.sinkTablePrefix);
+        if (binarySourceRecord != null)
+            collector.collect(binarySourceRecord);
     }
 
     @Override

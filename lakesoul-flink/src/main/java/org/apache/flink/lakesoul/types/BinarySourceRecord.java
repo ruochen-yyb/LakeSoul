@@ -37,8 +37,8 @@ public class BinarySourceRecord {
     private final String sourceRecordValue;
 
     public BinarySourceRecord(String topic, List<String> primaryKeys, TableId tableId, String tableLocation,
-                              List<String> partitionKeys, boolean isDDLRecord, LakeSoulRowDataWrapper data,
-                              String sourceRecordValue) {
+            List<String> partitionKeys, boolean isDDLRecord, LakeSoulRowDataWrapper data,
+            String sourceRecordValue) {
         this.topic = topic;
         this.primaryKeys = primaryKeys;
         this.tableId = tableId;
@@ -50,11 +50,11 @@ public class BinarySourceRecord {
     }
 
     public BinarySourceRecord(String topic, List<String> primaryKeys,
-                              List<String> partitionKeys,
-                              LakeSoulRowDataWrapper data,
-                              String sourceRecordValue,
-                              TableId tableId,
-                              boolean isDDL) {
+            List<String> partitionKeys,
+            LakeSoulRowDataWrapper data,
+            String sourceRecordValue,
+            TableId tableId,
+            boolean isDDL) {
         this.topic = topic;
         this.primaryKeys = primaryKeys;
         this.partitionKeys = partitionKeys;
@@ -64,16 +64,30 @@ public class BinarySourceRecord {
         this.isDDLRecord = isDDL;
     }
 
+    static String buildSinkTableName(String sinkTablePrefix, String sourceTableName) {
+        String prefix = StringUtils.isNotBlank(sinkTablePrefix) ? sinkTablePrefix.trim() : "s";
+        if (prefix.endsWith("_")) {
+            prefix = prefix.substring(0, prefix.length() - 1);
+        }
+        return String.format("%s_%s", prefix, sourceTableName).toLowerCase();
+    }
+
     public static BinarySourceRecord fromMysqlSourceRecord(SourceRecord sourceRecord,
-                                                           LakeSoulRecordConvert convert,
-                                                           String basePath,
-                                                           String sinkDBName) throws Exception {
+            LakeSoulRecordConvert convert,
+            String basePath,
+            String sinkDBName,
+            String sinkTablePrefix) throws Exception {
         Schema keySchema = sourceRecord.keySchema();
         TableId tableId = new TableId(io.debezium.relational.TableId.parse(sourceRecord.topic()).toLowercase());
         String originalNamespace = tableId.schema() == null ? tableId.catalog() : tableId.schema();
         String newNamespace = StringUtils.isNotBlank(sinkDBName) ? sinkDBName : originalNamespace;
-        String tableName = String.format("s_%s_%s", originalNamespace, tableId.table()).toLowerCase();
-        tableId = new TableId(newNamespace, newNamespace , tableName);
+        String tableName;
+        if (StringUtils.isNotBlank(sinkTablePrefix)) {
+            tableName = buildSinkTableName(sinkTablePrefix, tableId.table());
+        } else {
+            tableName = String.format("s_%s_%s", originalNamespace, tableId.table()).toLowerCase();
+        }
+        tableId = new TableId(newNamespace, newNamespace, tableName);
         boolean isDDL = "io.debezium.connector.mysql.SchemaChangeKey".equalsIgnoreCase(keySchema.name());
         if (isDDL) {
             return null;
