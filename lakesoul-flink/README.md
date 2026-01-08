@@ -16,6 +16,21 @@
     - 捕获当前库下 `special` 单表：
       - `--source_db.table.list='special'`
 
+- **参数 `source_db.exclude_tables`**
+
+  - **配置项**: `source_db.exclude_tables`
+  - **类型**: 字符串
+  - **作用**: 指定 MySQL CDC 任务需要排除的表列表（黑名单，逗号分隔），支持表名或正则模式。
+  - **互斥规则**: `source_db.exclude_tables` 与 `source_db.table.list` **不可同时配置**，需分开使用。
+  - **匹配规则**:
+    - 若条目中不包含点号 (`.`)，系统会自动补全为 `dbName + "." + 条目`，只作用于当前配置的 `source_db.db_name`。
+    - 若条目中已包含点号（形如 `db1.tmp_.*`），则按完整形式透传给 CDC 源（高级用法）。
+  - **示例**:
+    - 捕获当前库下所有表，但排除临时表与归档表：
+      - `--source_db.exclude_tables='tmp_.*,archive_.*'`
+    - 捕获当前库下所有表，但排除单表 `audit_log`：
+      - `--source_db.exclude_tables='audit_log'`
+
 - **参数 `sink_db_name`（目标库名 / Namespace）**
 
   - **配置项**: `sink_db_name`
@@ -47,6 +62,21 @@ flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink.jar \
   --source_db.port=3306 \
   --warehouse_path=file:///tmp/lakesoul \
   --source_db.table.list='user_.*,order_.*' \
+  --sink_db_name=lake_ods \
+  --sink_table_prefix=ods
+```
+
+- **入口 1（黑名单用法）：`org.apache.flink.lakesoul.entry.MysqlCdc`**
+
+```bash
+flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink.jar \
+  --source_db.db_name=mydb \
+  --source_db.user=root \
+  --source_db.password=xxx \
+  --source_db.host=127.0.0.1 \
+  --source_db.port=3306 \
+  --warehouse_path=file:///tmp/lakesoul \
+  --source_db.exclude_tables='tmp_.*,audit_log' \
   --sink_db_name=lake_ods \
   --sink_table_prefix=ods
 ```

@@ -20,7 +20,6 @@ import org.apache.flink.lakesoul.types.BinarySourceRecordSerializer;
 import org.apache.flink.lakesoul.types.LakeSoulRecordConvert;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
@@ -56,6 +55,14 @@ public class MysqlCdc {
                                 JOB_CHECKPOINT_INTERVAL.defaultValue()); // mill second
 
                 String tableListStr = parameter.get(SOURCE_DB_TABLE_LIST.key(), null);
+                String excludeTablesStr = parameter.get(SOURCE_DB_EXCLUDE_TABLES.key(), null);
+
+                boolean hasTableList = tableListStr != null && !tableListStr.trim().isEmpty();
+                boolean hasExcludeTables = excludeTablesStr != null && !excludeTablesStr.trim().isEmpty();
+                if (hasTableList && hasExcludeTables) {
+                        throw new IllegalArgumentException(
+                                        "参数冲突：`source_db.table.list`（白名单）与 `source_db.exclude_tables`（黑名单）不可同时配置，请分开使用");
+                }
 
                 MysqlDBManager mysqlDBManager = new MysqlDBManager(dbName,
                                 userName,
@@ -84,6 +91,9 @@ public class MysqlCdc {
                 conf.set(SERVER_TIME_ZONE, serverTimezone);
                 if (tableListStr != null) {
                         conf.set(SOURCE_DB_TABLE_LIST, tableListStr);
+                }
+                if (excludeTablesStr != null) {
+                        conf.set(SOURCE_DB_EXCLUDE_TABLES, excludeTablesStr);
                 }
                 conf.set(SINK_TABLE_PREFIX, sinkTablePrefix);
 
@@ -125,7 +135,7 @@ public class MysqlCdc {
                 ));
 
                 String[] tableList;
-                if (tableListStr == null || tableListStr.trim().isEmpty()) {
+                if (!hasTableList) {
                         tableList = new String[] { dbName + ".*" };
                 } else {
                         tableList = Arrays.stream(tableListStr.split(","))
@@ -156,6 +166,21 @@ public class MysqlCdc {
                 jdbcProperties.put("allowPublicKeyRetrieval", "true");
                 jdbcProperties.put("useSSL", "false");
                 sourceBuilder.jdbcProperties(jdbcProperties);
+
+                if (hasExcludeTables) {
+                        String excludeList = Arrays.stream(excludeTablesStr.split(","))
+                                        .map(String::trim)
+                                        .filter(s -> !s.isEmpty())
+                                        .map(t -> t.contains(".") ? t : dbName + "." + t)
+                                        .reduce((a, b) -> a + "," + b)
+                                        .orElse("");
+                        if (!excludeList.isEmpty()) {
+                                Properties debeziumProperties = new Properties();
+                                // Debezium: comma-separated fully-qualified table names or regex patterns
+                                debeziumProperties.setProperty("table.exclude.list", excludeList);
+                                sourceBuilder.debeziumProperties(debeziumProperties);
+                        }
+                }
                 MySqlSource<BinarySourceRecord> mySqlSource = sourceBuilder.build();
 
                 LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
@@ -166,7 +191,7 @@ public class MysqlCdc {
                 DataStreamSource<BinarySourceRecord> source = builder.buildMultiTableSource("MySQL Source");
 
                 DataStream<BinarySourceRecord> stream = builder.buildHashPartitionedCDCStream(source);
-                DataStreamSink<BinarySourceRecord> dmlSink = builder.buildLakeSoulDMLSink(stream);
+                builder.buildLakeSoulDMLSink(stream);
                 env.execute("LakeSoul CDC Sink From MySQL Database " + dbName);
         }
 }
