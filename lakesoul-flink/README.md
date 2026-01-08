@@ -22,6 +22,8 @@
   - **类型**: 字符串
   - **作用**: 指定 MySQL CDC 任务需要排除的表列表（黑名单，逗号分隔），支持表名或正则模式。
   - **互斥规则**: `source_db.exclude_tables` 与 `source_db.table.list` **不可同时配置**，需分开使用。
+  - **生效机制**: 黑名单模式下会在任务启动时通过 JDBC 枚举 `source_db.db_name` 下的所有表名并执行过滤，生成最终 include 的 `tableList` 交给 Source（用于避免 chunk splitting 阶段仍分析被排除表）。
+  - **注意**: 需要账号具备读取库表元数据的权限（例如 `information_schema` / `SHOW TABLES`）。
   - **匹配规则**:
     - 若条目中不包含点号 (`.`)，系统会自动补全为 `dbName + "." + 条目`，只作用于当前配置的 `source_db.db_name`。
     - 若条目中已包含点号（形如 `db1.tmp_.*`），则按完整形式透传给 CDC 源（高级用法）。

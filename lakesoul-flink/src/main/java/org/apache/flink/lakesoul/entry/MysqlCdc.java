@@ -25,10 +25,18 @@ import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 import static org.apache.flink.lakesoul.tool.JobOptions.FLINK_CHECKPOINT;
 import static org.apache.flink.lakesoul.tool.JobOptions.JOB_CHECKPOINT_INTERVAL;
@@ -135,7 +143,10 @@ public class MysqlCdc {
                 ));
 
                 String[] tableList;
-                if (!hasTableList) {
+                if (hasExcludeTables) {
+                        tableList = buildIncludedTableListByBlacklist(dbName, host, port, userName, passWord,
+                                        excludeTablesStr);
+                } else if (!hasTableList) {
                         tableList = new String[] { dbName + ".*" };
                 } else {
                         tableList = Arrays.stream(tableListStr.split(","))
@@ -166,21 +177,6 @@ public class MysqlCdc {
                 jdbcProperties.put("allowPublicKeyRetrieval", "true");
                 jdbcProperties.put("useSSL", "false");
                 sourceBuilder.jdbcProperties(jdbcProperties);
-
-                if (hasExcludeTables) {
-                        String excludeList = Arrays.stream(excludeTablesStr.split(","))
-                                        .map(String::trim)
-                                        .filter(s -> !s.isEmpty())
-                                        .map(t -> t.contains(".") ? t : dbName + "." + t)
-                                        .reduce((a, b) -> a + "," + b)
-                                        .orElse("");
-                        if (!excludeList.isEmpty()) {
-                                Properties debeziumProperties = new Properties();
-                                // Debezium: comma-separated fully-qualified table names or regex patterns
-                                debeziumProperties.setProperty("table.exclude.list", excludeList);
-                                sourceBuilder.debeziumProperties(debeziumProperties);
-                        }
-                }
                 MySqlSource<BinarySourceRecord> mySqlSource = sourceBuilder.build();
 
                 LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
@@ -193,5 +189,90 @@ public class MysqlCdc {
                 DataStream<BinarySourceRecord> stream = builder.buildHashPartitionedCDCStream(source);
                 builder.buildLakeSoulDMLSink(stream);
                 env.execute("LakeSoul CDC Sink From MySQL Database " + dbName);
+        }
+
+        private static String[] buildIncludedTableListByBlacklist(
+                        String dbName,
+                        String host,
+                        int port,
+                        String user,
+                        String password,
+                        String excludeTablesStr) {
+                List<Pattern> excludePatterns = parseExcludeTablePatterns(dbName, excludeTablesStr);
+                excludePatterns.add(Pattern.compile("sys_config"));
+
+                List<String> included = new ArrayList<>();
+                Properties props = new Properties();
+                props.put("user", user);
+                props.put("password", password);
+                props.put("useSSL", "false");
+                props.put("allowPublicKeyRetrieval", "true");
+                String url = "jdbc:mysql://" + host + ":" + port + "/" + dbName
+                                + "?useSSL=false&allowPublicKeyRetrieval=true";
+                try (Connection connection = DriverManager.getConnection(url, props)) {
+                        DatabaseMetaData dmd = connection.getMetaData();
+                        try (ResultSet tables = dmd.getTables(null, null, null, new String[] { "TABLE" })) {
+                                while (tables.next()) {
+                                        String tableCat = tables.getString("TABLE_CAT");
+                                        if (tableCat != null && !dbName.equalsIgnoreCase(tableCat)) {
+                                                continue;
+                                        }
+                                        String tableName = tables.getString("TABLE_NAME");
+                                        if (tableName == null || tableName.trim().isEmpty()) {
+                                                continue;
+                                        }
+                                        if (isExcluded(excludePatterns, tableName)) {
+                                                continue;
+                                        }
+                                        included.add(dbName + "." + tableName);
+                                }
+                        }
+                } catch (SQLException e) {
+                        throw new RuntimeException(
+                                        "黑名单模式下枚举 MySQL 表失败，请确认账号有读取元数据权限（information_schema/SHOW TABLES）："
+                                                        + dbName,
+                                        e);
+                }
+
+                if (included.isEmpty()) {
+                        throw new IllegalArgumentException("黑名单过滤后无可捕获表，请检查 `source_db.exclude_tables`："
+                                        + excludeTablesStr);
+                }
+                return included.toArray(String[]::new);
+        }
+
+        private static boolean isExcluded(List<Pattern> excludePatterns, String tableName) {
+                for (Pattern p : excludePatterns) {
+                        if (p.matcher(tableName).matches()) {
+                                return true;
+                        }
+                }
+                return false;
+        }
+
+        private static List<Pattern> parseExcludeTablePatterns(String dbName, String excludeTablesStr) {
+                List<Pattern> patterns = new ArrayList<>();
+                if (excludeTablesStr == null || excludeTablesStr.trim().isEmpty()) {
+                        return patterns;
+                }
+                for (String raw : excludeTablesStr.split(",")) {
+                        String t = raw == null ? "" : raw.trim();
+                        if (t.isEmpty()) {
+                                continue;
+                        }
+                        if (t.contains(".")) {
+                                String[] parts = t.split("\\.", 2);
+                                String db = parts[0];
+                                String tblPattern = parts.length == 2 ? parts[1] : "";
+                                if (!dbName.equalsIgnoreCase(db) && !"*".equals(db) && !".*".equals(db)) {
+                                        continue;
+                                }
+                                t = tblPattern;
+                        }
+                        if (!t.isEmpty()) {
+                                patterns.add(Pattern.compile(t));
+                        }
+                }
+                return patterns;
         }
 }
