@@ -29,8 +29,14 @@ import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.*;
 import org.apache.flink.types.Row;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import java.sql.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -39,6 +45,21 @@ import static org.apache.flink.lakesoul.tool.JobOptions.JOB_CHECKPOINT_INTERVAL;
 import static org.apache.flink.lakesoul.tool.LakeSoulSinkDatabasesOptions.*;
 
 public class SyncDatabase {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SyncDatabase.class);
+    /**
+     * 时间格式与 LakeSoul Flink SQL hint 一致：yyyy-MM-dd HH:mm:ss
+     *
+     * <p>注意：该格式校验仅用于启动参数合法性检查，不改变 LakeSoul 侧的解析逻辑。</p>
+     */
+    private static final DateTimeFormatter SOURCE_TIME_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    // 以 source.* 前缀承载 LakeSoul source 查询 hint，避免与现有参数冲突
+    private static final String SOURCE_READ_TYPE_KEY = "source.readtype";
+    private static final String SOURCE_READ_START_TIME_KEY = "source.readstarttime";
+    private static final String SOURCE_READ_END_TIME_KEY = "source.readendtime";
+    private static final String SOURCE_TIMEZONE_KEY = "source.timezone";
 
     static String targetTableName;
     static String dbType;
@@ -54,6 +75,15 @@ public class SyncDatabase {
     static int checkpointInterval;
     static LakeSoulInAndOutputJobListener listener;
     static String lineageUrl = null;
+
+    /**
+     * LakeSoul source 读取 hint（仅在流式出湖时生效）。
+     *
+     * <p>通过 Flink SQL 的 {@code /*+ OPTIONS('k'='v') *\/} 传递至 LakeSoul connector，
+     * 用于控制增量读起点（readstarttime）、读类型（readtype）等。</p>
+     */
+    @Nullable
+    static String lakesoulSourceSelectSql;
 
     public static void main(String[] args) throws Exception {
         StringBuilder connectorOptions = new StringBuilder();
@@ -88,6 +118,10 @@ public class SyncDatabase {
         }
         sinkParallelism = parameter.getInt(SINK_PARALLELISM.key(), SINK_PARALLELISM.defaultValue());
         useBatch = parameter.getBoolean(BATHC_STREAM_SINK.key(), BATHC_STREAM_SINK.defaultValue());
+
+        // 构造 LakeSoul source 的 SELECT SQL（可选携带读取 hint），并做必要参数校验
+        lakesoulSourceSelectSql = buildLakeSoulSourceSelectSql(parameter, useBatch, sourceDatabase, sourceTableName);
+
         Configuration conf = new Configuration();
         conf.setString(RestOptions.BIND_PORT, "8081-8089");
         StreamExecutionEnvironment env = null;
@@ -134,6 +168,134 @@ public class SyncDatabase {
             default:
                 throw new RuntimeException("not supported the database: " + dbType);
         }
+    }
+
+    /**
+     * 构造形如 {@code select * from lakeSoul.`db`.`table` /*+ OPTIONS(...) *\/} 的查询。
+     *
+     * <p>兼容性策略：</p>
+     * <ul>
+     *   <li>批模式（useBatch=true）永远不拼接 hints；即使用户传了 source.*，也只 warn 并忽略。</li>
+     *   <li>流模式（useBatch=false）且用户传入任一 source.* 时启用 hints；未指定 readtype 时默认补 incremental。</li>
+     *   <li>流模式但未传任何 source.* 时保持原行为（不拼 hints）。</li>
+     * </ul>
+     */
+    @Nullable
+    private static String buildLakeSoulSourceSelectSql(
+            ParameterTool parameter,
+            boolean useBatch,
+            String sourceDatabase,
+            String sourceTableName) {
+        // base：建议对 db/table 都加反引号，避免关键字/特殊字符导致 SQL 解析失败
+        final String baseFrom = "lakeSoul.`" + sourceDatabase + "`.`" + sourceTableName + "`";
+
+        final String readType = trimToEmpty(parameter.get(SOURCE_READ_TYPE_KEY, ""));
+        final String readStartTime = trimToEmpty(parameter.get(SOURCE_READ_START_TIME_KEY, ""));
+        final String readEndTime = trimToEmpty(parameter.get(SOURCE_READ_END_TIME_KEY, ""));
+        final String timezone = trimToEmpty(parameter.get(SOURCE_TIMEZONE_KEY, ""));
+
+        final boolean anySourceOptionProvided =
+                !readType.isEmpty() || !readStartTime.isEmpty() || !readEndTime.isEmpty() || !timezone.isEmpty();
+
+        if (useBatch) {
+            if (anySourceOptionProvided) {
+                LOG.warn("检测到 source.* 读取参数，但当前为批出湖(use_batch=true)，将忽略 source.*：{}={} {}={} {}={} {}={}",
+                        SOURCE_READ_TYPE_KEY, readType,
+                        SOURCE_READ_START_TIME_KEY, readStartTime,
+                        SOURCE_READ_END_TIME_KEY, readEndTime,
+                        SOURCE_TIMEZONE_KEY, timezone);
+            }
+            // 维持原有批模式行为
+            return "select * from " + baseFrom;
+        }
+
+        // 流模式：只有当用户显式提供任一 source.* 才启用 hints，避免改变历史默认行为
+        if (!anySourceOptionProvided) {
+            return "select * from " + baseFrom;
+        }
+
+        // 校验 timezone（如果传入）
+        if (!timezone.isEmpty() && !isValidTimeZoneId(timezone)) {
+            throw new IllegalArgumentException(
+                    String.format("参数 --%s=%s 非法：timezone 不存在。示例：--%s=Asia/Shanghai",
+                            SOURCE_TIMEZONE_KEY, timezone, SOURCE_TIMEZONE_KEY));
+        }
+
+        // 校验时间格式（如果传入）
+        if (!readStartTime.isEmpty()) {
+            validateDateTime(readStartTime, SOURCE_READ_START_TIME_KEY);
+        }
+        if (!readEndTime.isEmpty()) {
+            validateDateTime(readEndTime, SOURCE_READ_END_TIME_KEY);
+        }
+
+        // 若同时提供 start/end，则校验 start <= end
+        if (!readStartTime.isEmpty() && !readEndTime.isEmpty()) {
+            final LocalDateTime start = LocalDateTime.parse(readStartTime, SOURCE_TIME_FORMATTER);
+            final LocalDateTime end = LocalDateTime.parse(readEndTime, SOURCE_TIME_FORMATTER);
+            if (start.isAfter(end)) {
+                throw new IllegalArgumentException(
+                        String.format("参数 --%s=%s 与 --%s=%s 冲突：readstarttime 必须 <= readendtime",
+                                SOURCE_READ_START_TIME_KEY, readStartTime,
+                                SOURCE_READ_END_TIME_KEY, readEndTime));
+            }
+        }
+
+        // 组装 OPTIONS。启用 hints 且用户未传 readtype 时，默认补 incremental
+        final Map<String, String> options = new LinkedHashMap<>();
+        final String effectiveReadType = readType.isEmpty() ? "incremental" : readType;
+        options.put("readtype", effectiveReadType);
+        if (!readStartTime.isEmpty()) {
+            options.put("readstarttime", readStartTime);
+        }
+        if (!readEndTime.isEmpty()) {
+            options.put("readendtime", readEndTime);
+        }
+        if (!timezone.isEmpty()) {
+            options.put("timezone", timezone);
+        }
+
+        final String optionsHint = buildOptionsHint(options);
+        LOG.info("启用 LakeSoul source 读取 hint：table={}.{}，options={}", sourceDatabase, sourceTableName, options);
+        return "select * from " + baseFrom + " " + optionsHint;
+    }
+
+    private static String buildOptionsHint(Map<String, String> options) {
+        // 形如：/*+ OPTIONS('k'='v','k2'='v2')*/
+        // 注意：这里不做复杂转义；时间/时区等参数不应包含单引号
+        StringBuilder sb = new StringBuilder("/*+ OPTIONS(");
+        boolean first = true;
+        for (Map.Entry<String, String> e : options.entrySet()) {
+            if (!first) {
+                sb.append(",");
+            }
+            first = false;
+            sb.append("'").append(e.getKey()).append("'")
+                    .append("=")
+                    .append("'").append(e.getValue()).append("'");
+        }
+        sb.append(")*/");
+        return sb.toString();
+    }
+
+    private static void validateDateTime(String value, String key) {
+        try {
+            LocalDateTime.parse(value, SOURCE_TIME_FORMATTER);
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException(
+                    String.format("参数 --%s=%s 非法：时间格式必须为 yyyy-MM-dd HH:mm:ss，例如 2026-01-14 00:00:00",
+                            key, value),
+                    e);
+        }
+    }
+
+    private static boolean isValidTimeZoneId(String timezone) {
+        // 与 connector 内部使用方式保持一致：基于可用时区 ID 列表判断
+        return Arrays.asList(TimeZone.getAvailableIDs()).contains(timezone);
+    }
+
+    private static String trimToEmpty(String s) {
+        return s == null ? "" : s.trim();
     }
 
     public static String pgAndMsqlCreateTableSql(String[] stringFieldTypes, String[] fieldNames, String targetTableName, String pk) {
@@ -316,7 +478,8 @@ public class SyncDatabase {
             }
         }
         tEnvs.executeSql(sql);
-        tEnvs.executeSql("insert into " + targetTableName + " select * from lakeSoul.`" + sourceDatabase + "`." + sourceTableName);
+        // 统一通过 lakesoulSourceSelectSql 进行 source 读取（可选带 hints）
+        tEnvs.executeSql("insert into " + targetTableName + " " + lakesoulSourceSelectSql);
         statement.close();
         conn.close();
     }
@@ -381,7 +544,8 @@ public class SyncDatabase {
         }
 
         tEnvs.executeSql(sql);
-        tEnvs.executeSql("insert into " + targetTableName + " select * from lakeSoul.`" + sourceDatabase + "`." + sourceTableName);
+        // 统一通过 lakesoulSourceSelectSql 进行 source 读取（可选带 hints）
+        tEnvs.executeSql("insert into " + targetTableName + " " + lakesoulSourceSelectSql);
 
         statement.close();
         conn.close();
