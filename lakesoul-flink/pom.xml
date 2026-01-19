@@ -7,8 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <parent>
         <artifactId>lakesoul-parent</artifactId>
         <groupId>com.dmetasoul</groupId>
@@ -303,7 +303,8 @@ SPDX-License-Identifier: Apache-2.0
             <scope>test</scope>
         </dependency>
 
-        <!--The following 3 are required to run tests with access to s3/hdfs-->
+        <!--The
+        following 3 are required to run tests with access to s3/hdfs-->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-s3-fs-hadoop</artifactId>
@@ -405,28 +406,6 @@ SPDX-License-Identifier: Apache-2.0
     <build>
         <plugins>
             <plugin>
-                <groupId>net.alchim31.maven</groupId>
-                <artifactId>scala-maven-plugin</artifactId>
-                <version>4.9.0</version>
-                <executions>
-                    <execution>
-                        <id>scala-compile-first</id>
-                        <phase>process-resources</phase>
-                        <goals>
-                            <goal>add-source</goal>
-                            <goal>compile</goal>
-                        </goals>
-                    </execution>
-                    <execution>
-                        <id>scala-test-compile</id>
-                        <phase>process-test-resources</phase>
-                        <goals>
-                            <goal>testCompile</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-            <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
@@ -442,6 +421,38 @@ SPDX-License-Identifier: Apache-2.0
                     <source>16</source>
                     <target>16</target>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>4.9.0</version>
+                <configuration>
+                    <compileOrder>Mixed</compileOrder>
+                    <recompileMode>all</recompileMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>scala-add-source</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>add-source</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>scala-compile</id>
+                        <phase>compile</phase>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>scala-test-compile</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -689,7 +700,7 @@ SPDX-License-Identifier: Apache-2.0
                     </relocations>
                     <transformers>
                         <transformer
-                                implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
                     </transformers>
                 </configuration>
             </plugin>

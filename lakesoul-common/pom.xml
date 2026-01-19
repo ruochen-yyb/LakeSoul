@@ -7,8 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <parent>
         <artifactId>lakesoul-parent</artifactId>
         <groupId>com.dmetasoul</groupId>
@@ -59,28 +59,6 @@ SPDX-License-Identifier: Apache-2.0
                 </executions>
             </plugin>
             <plugin>
-                <groupId>net.alchim31.maven</groupId>
-                <artifactId>scala-maven-plugin</artifactId>
-                <version>4.9.0</version>
-                <executions>
-                    <execution>
-                        <id>scala-compile-first</id>
-                        <phase>process-resources</phase>
-                        <goals>
-                            <goal>add-source</goal>
-                            <goal>compile</goal>
-                        </goals>
-                    </execution>
-                    <execution>
-                        <id>scala-test-compile</id>
-                        <phase>process-test-resources</phase>
-                        <goals>
-                            <goal>testCompile</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-            <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
@@ -89,6 +67,37 @@ SPDX-License-Identifier: Apache-2.0
                         <phase>compile</phase>
                         <goals>
                             <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>4.9.0</version>
+                <configuration>
+                    <compileOrder>Mixed</compileOrder>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>scala-add-source</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>add-source</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>scala-compile</id>
+                        <phase>compile</phase>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>scala-test-compile</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>testCompile</goal>
                         </goals>
                     </execution>
                 </executions>
@@ -239,7 +248,8 @@ SPDX-License-Identifier: Apache-2.0
                                 </goals>
                                 <configuration>
                                     <executable>cargo</executable>
-                                    <commandlineArgs>build --release --all-features --package lakesoul-metadata-c
+                                    <commandlineArgs>build --release --all-features --package
+                                        lakesoul-metadata-c
                                     </commandlineArgs>
                                     <workingDirectory>${basedir}/../rust</workingDirectory>
                                 </configuration>
@@ -299,7 +309,8 @@ SPDX-License-Identifier: Apache-2.0
                                 </goals>
                                 <configuration>
                                     <executable>cross</executable>
-                                    <commandlineArgs>build --target x86_64-unknown-linux-gnu --release --all-features
+                                    <commandlineArgs>build --target x86_64-unknown-linux-gnu
+                                        --release --all-features
                                         --package lakesoul-metadata-c
                                     </commandlineArgs>
                                     <workingDirectory>${basedir}/../rust/</workingDirectory>
