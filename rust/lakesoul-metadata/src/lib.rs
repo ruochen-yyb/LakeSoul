@@ -1709,16 +1709,32 @@ pub async fn execute_query_scalar(
 }
 
 pub async fn clean_meta_for_test(client: &PooledClient) -> Result<i32> {
+    error!(
+        "
+        ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️\n
+        ⚠️             有人调用了我!!!             ⚠️\n
+        ⚠️ 按照原有逻辑会清空元数据库, 请仔细检查代码!!! ⚠️\n
+        ⚠️             数据无价!!!                ⚠️\n
+        ⚠️             数据无价!!!                ⚠️\n
+        ⚠️             数据无价!!!                ⚠️\n
+        ⚠️             谨慎操作!!!                ⚠️\n
+        ⚠️             谨慎操作!!!                ⚠️\n
+        ⚠️             谨慎操作!!!                ⚠️\n
+        ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️\n
+        {:?}\n",
+        client
+    );
     let result = client
-        .batch_execute(
-            "delete from namespace;
-            delete from data_commit_info;
-            delete from table_info;
-            delete from table_path_id;
-            delete from table_name_id;
-            delete from partition_info;
-            delete from discard_compressed_file_info",
-        )
+        // .batch_execute(
+        //     "delete from namespace;
+        //     delete from data_commit_info;
+        //     delete from table_info;
+        //     delete from table_path_id;
+        //     delete from table_name_id;
+        //     delete from partition_info;
+        //     delete from discard_compressed_file_info",
+        // )
+        .batch_execute("SELECT 1;")
         .await;
     match result {
         Ok(_) => Ok(0i32),
