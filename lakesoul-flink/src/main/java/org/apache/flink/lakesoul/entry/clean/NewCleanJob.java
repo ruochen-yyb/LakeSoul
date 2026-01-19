@@ -46,13 +46,12 @@ public class NewCleanJob {
     private static CleanUtils cleanUtils;
     private static String targetTables;
 
-
     public static void main(String[] args) throws Exception {
         ParameterTool parameter = ParameterTool.fromArgs(args);
         PgDeserialization deserialization = new PgDeserialization();
         Properties debeziumProperties = new Properties();
         debeziumProperties.setProperty("include.unknown.datatypes", "true");
-        String[] tableList = new String[]{"public.partition_info"};
+        String[] tableList = new String[] { "public.partition_info" };
 
         userName = parameter.get(SourceOptions.SOURCE_DB_USER.key());
         dbName = parameter.get(SourceOptions.SOURCE_DB_DB_NAME.key());
@@ -64,54 +63,54 @@ public class NewCleanJob {
         splitSize = parameter.getInt(SourceOptions.SPLIT_SIZE.key(), SourceOptions.SPLIT_SIZE.defaultValue());
         schemaList = parameter.get(SourceOptions.SCHEMA_LIST.key());
         pgUrl = parameter.get(SourceOptions.PG_URL.key());
-        sourceParallelism = parameter.getInt(SourceOptions.SOURCE_PARALLELISM.key(), SourceOptions.SOURCE_PARALLELISM.defaultValue());
-        targetTables = parameter.get(SourceOptions.TARGET_TABLES.key(),null);
+        sourceParallelism = parameter.getInt(SourceOptions.SOURCE_PARALLELISM.key(),
+                SourceOptions.SOURCE_PARALLELISM.defaultValue());
+        targetTables = parameter.get(SourceOptions.TARGET_TABLES.key(), null);
 
-        //int ontimerInterval = 60000;
+        // int ontimerInterval = 60000;
         int ontimerInterval = parameter.getInt(SourceOptions.ONTIMER_INTERVAL.key(), 5) * 60000;
-        //expiredTime = 60000;
-        expiredTime = parameter.getInt(SourceOptions.DATA_EXPIRED_TIME.key(), 3) ;
-        if (expiredTime < 10){
+        // expiredTime = 60000;
+        expiredTime = parameter.getInt(SourceOptions.DATA_EXPIRED_TIME.key(), 3);
+        if (expiredTime < 10) {
             expiredTime = expiredTime * 86400000;
         }
-        JdbcIncrementalSource<String> postgresIncrementalSource =
-                PostgresSourceBuilder.PostgresIncrementalSource.<String>builder()
-                        .hostname(host)
-                        .port(port)
-                        .database(dbName)
-                        .schemaList(schemaList)
-                        .tableList(tableList)
-                        .username(userName)
-                        .password(passWord)
-                        .slotName(slotName)
-                        .decodingPluginName(pluginName) // use pgoutput for PostgreSQL 10+
-                        .deserializer(deserialization)
-                        .splitSize(splitSize) // the split size of each snapshot split
-                        .debeziumProperties(debeziumProperties)
-                        .build();
+        JdbcIncrementalSource<String> postgresIncrementalSource = PostgresSourceBuilder.PostgresIncrementalSource
+                .<String>builder()
+                .hostname(host)
+                .port(port)
+                .database(dbName)
+                .schemaList(schemaList)
+                .tableList(tableList)
+                .username(userName)
+                .password(passWord)
+                .slotName(slotName)
+                .decodingPluginName(pluginName) // use pgoutput for PostgreSQL 10+
+                .deserializer(deserialization)
+                .splitSize(splitSize) // the split size of each snapshot split
+                .debeziumProperties(debeziumProperties)
+                .build();
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
         DataStream<String> tickStream = env
                 .addSource(new TickSource(ontimerInterval));
 
-
         DataStreamSource<String> postgresParallelSource = env.fromSource(
-                        postgresIncrementalSource,
-                        WatermarkStrategy.noWatermarks(),
-                        "PostgresParallelSource")
+                postgresIncrementalSource,
+                WatermarkStrategy.noWatermarks(),
+                "PostgresParallelSource")
                 .setParallelism(sourceParallelism);
 
         CleanUtils utils = new CleanUtils();
         Connection connection = DriverManager.getConnection(pgUrl, userName, passWord);
         List<String> tableIdList = utils.getTableIdByTableName(targetTables, connection);
 
-        SingleOutputStreamOperator<PartitionInfo> filter = postgresParallelSource.map(new PartitionInfoRecordGets.metaMapper(tableIdList))
+        SingleOutputStreamOperator<PartitionInfo> filter = postgresParallelSource
+                .map(new PartitionInfoRecordGets.metaMapper(tableIdList))
                 .filter(Objects::nonNull);
 
-        SingleOutputStreamOperator<PartitionInfo> streamOperator =
-                tickStream.connect(filter)
-                        .flatMap(new TickTriggeringCleaner(pgUrl, userName, passWord, expiredTime));
+        SingleOutputStreamOperator<PartitionInfo> streamOperator = tickStream.connect(filter)
+                .flatMap(new TickTriggeringCleaner(pgUrl, userName, passWord, expiredTime));
 
         streamOperator.keyBy(value -> value.table_id + "/" + value.partition_desc)
                 .process(new ProcessClean(pgUrl, userName, passWord, expiredTime, ontimerInterval));
@@ -145,42 +144,43 @@ public class NewCleanJob {
         @Override
         public void open(Configuration parameters) throws SQLException, ClassNotFoundException {
             // 初始化状态变量
-            MapStateDescriptor<String, PartitionInfo.WillStateValue> willStateDesc =
-                    new MapStateDescriptor<>("willStateDesc", String.class, PartitionInfo.WillStateValue.class);
+            MapStateDescriptor<String, PartitionInfo.WillStateValue> willStateDesc = new MapStateDescriptor<>(
+                    "willStateDesc", String.class, PartitionInfo.WillStateValue.class);
             willState = getRuntimeContext().getMapState(willStateDesc);
 
-            MapStateDescriptor<String, Long> compactNewStateDesc =
-                    new MapStateDescriptor<>("newCompactDesc", String.class, Long.class);
+            MapStateDescriptor<String, Long> compactNewStateDesc = new MapStateDescriptor<>("newCompactDesc",
+                    String.class, Long.class);
             compactNewState = getRuntimeContext().getMapState(compactNewStateDesc);
 
-            ValueStateDescriptor<Boolean> initDesc =
-                    new ValueStateDescriptor<>("timerInit", Boolean.class, false);
+            ValueStateDescriptor<Boolean> initDesc = new ValueStateDescriptor<>("timerInit", Boolean.class, false);
             timerInitializedState = getRuntimeContext().getState(initDesc);
 
-            ValueStateDescriptor<Boolean> compactVersionDesc =
-                    new ValueStateDescriptor<>("compactVersion", Boolean.class, true);
+            ValueStateDescriptor<Boolean> compactVersionDesc = new ValueStateDescriptor<>("compactVersion",
+                    Boolean.class, true);
             compactionVersionState = getRuntimeContext().getState(compactVersionDesc);
 
-            //PGConnectionPool.init(pgUrl, userName, password);
-            //pgConnection = PGConnectionPool.getConnection();
+            // PGConnectionPool.init(pgUrl, userName, password);
+            // pgConnection = PGConnectionPool.getConnection();
             Class.forName("org.postgresql.Driver");
-            pgConnection = DriverManager.getConnection(pgUrl,userName,password);
+            pgConnection = DriverManager.getConnection(pgUrl, userName, password);
             cleanUtils = new CleanUtils();
 
         }
 
         @Override
-        public void processElement(PartitionInfo value, KeyedProcessFunction<String, PartitionInfo, String>.Context ctx, Collector<String> out) throws Exception {
+        public void processElement(PartitionInfo value, KeyedProcessFunction<String, PartitionInfo, String>.Context ctx,
+                Collector<String> out) throws Exception {
             String tableId = value.table_id;
             String partitionDesc = value.partition_desc;
             String commitOp = value.commit_op;
             long timestamp = value.timestamp;
             int version = value.version;
             List<String> snapshot = value.snapshot;
-            if (commitOp.equals("CompactionCommit") || commitOp.equals("UpdateCommit") ){
-                if ( snapshot.size() == 1) {
-                    boolean isOldCompaction = commitOp.equals("UpdateCommit") || cleanUtils.getCompactVersion(tableId, partitionDesc, version, pgConnection);
-                    log.info("当前识别出来为旧版压缩："+ isOldCompaction);
+            if (commitOp.equals("CompactionCommit") || commitOp.equals("UpdateCommit")) {
+                if (snapshot.size() == 1) {
+                    boolean isOldCompaction = commitOp.equals("UpdateCommit")
+                            || cleanUtils.getCompactVersion(tableId, partitionDesc, version, pgConnection);
+                    log.info("当前识别出来为旧版压缩：" + isOldCompaction);
                     compactionVersionState.update(isOldCompaction);
                 }
             }
@@ -196,8 +196,14 @@ public class NewCleanJob {
                     long compactTime = compactNewState.get(tableId + "/" + partitionDesc);
                     if (timestamp < compactTime - expiredTime) {
                         log.info("1:当前压缩版本是旧版本：" + compactVersion);
-                        cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc, pgConnection, compactVersion);
-                        cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                        boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                                pgConnection, compactVersion);
+                        if (ok) {
+                            cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                        } else {
+                            // keep metadata/state for retry on timer
+                            willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
+                        }
                     } else {
                         willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
                     }
@@ -208,15 +214,20 @@ public class NewCleanJob {
             if (commitOp.equals("CompactionCommit") || commitOp.equals("UpdateCommit")) {
                 if (snapshot.size() == 1) {
                     if (compactNewState.contains(tableId + "/" + partitionDesc)) {
-                        long compactTime = compactNewState.get(tableId + "/" + partitionDesc) ;
+                        long compactTime = compactNewState.get(tableId + "/" + partitionDesc);
                         if (timestamp > compactTime) {
                             compactNewState.put(tableId + "/" + partitionDesc, timestamp);
                             willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
                         } else {
                             if (timestamp < compactTime - expiredTime) {
                                 log.info("2:当前压缩版本是旧版本：" + compactVersion);
-                                cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc, pgConnection, compactVersion);
-                                cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                                boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                                        pgConnection, compactVersion);
+                                if (ok) {
+                                    cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                                } else {
+                                    willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
+                                }
                             } else {
                                 willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
                             }
@@ -231,8 +242,13 @@ public class NewCleanJob {
                         long compactTime = compactNewState.get(tableId + "/" + partitionDesc);
                         if (timestamp < compactTime - expiredTime) {
                             log.info("3 当前压缩版本是旧版本： " + compactVersion);
-                            cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc, pgConnection, compactVersion);
-                            cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                            boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                                    pgConnection, compactVersion);
+                            if (ok) {
+                                cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                            } else {
+                                willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
+                            }
                         } else {
                             willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
                         }
@@ -256,7 +272,7 @@ public class NewCleanJob {
                     String[] keys = willStateEntry.getKey().split("/");
                     String tableId = keys[0];
                     String partitionDesc = keys[1];
-                    if (cleanUtils.partitionExist(tableId, partitionDesc, pgConnection)){
+                    if (cleanUtils.partitionExist(tableId, partitionDesc, pgConnection)) {
                         int version = Integer.parseInt(keys[2]);
                         List<String> snapshot = willStateEntry.getValue().snapshot;
                         String compositeKey = tableId + "/" + partitionDesc;
@@ -264,9 +280,15 @@ public class NewCleanJob {
                             PartitionInfo.WillStateValue stateValue = willStateEntry.getValue();
                             if (stateValue.timestamp < expiredThreshold) {
                                 log.info("4 当前压缩版本为旧版本：" + compactionVersionState.value());
-                                cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc, pgConnection, compactionVersionState.value());
-                                cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
-                                willStateIterator.remove();
+                                boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                                        pgConnection, compactionVersionState.value());
+                                if (ok) {
+                                    cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                                    willStateIterator.remove();
+                                } else {
+                                    log.warn("清理失败，保留状态以便下次重试: tableId={}, partitionDesc={}, version={}",
+                                            tableId, partitionDesc, version);
+                                }
                             }
                         }
                     } else {
@@ -291,4 +313,3 @@ public class NewCleanJob {
         }
     }
 }
-

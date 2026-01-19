@@ -3,17 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 package org.apache.flink.lakesoul.entry.clean;
 
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
+import org.apache.flink.core.fs.FileSystem;
+import org.apache.flink.core.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.sql.*;
 import java.util.*;
 import java.util.regex.Matcher;
@@ -92,76 +89,43 @@ public class CleanUtils {
         }
     }
 
-    private static final String HDFS_URI_PREFIX = "hdfs:/";
-    private static final String S3_URI_PREFIX = "s3:/";
-
-    public void deleteFile(List<String> filePathList) throws SQLException {
+    /**
+     * Delete files via Flink {@link FileSystem} so the job can reuse Flink cluster's filesystem plugins/config
+     * (e.g. flink-s3-fs-hadoop + s3.* for Ceph/S3-compatible storage).
+     *
+     * @return true if all deletions succeed (or files do not exist); false otherwise.
+     */
+    public boolean deleteFile(List<String> filePathList) {
         UUID id = UUID.randomUUID();
-        logger.info("[Clean-{}]: begin",id);
-        Configuration hdfsConfig = new Configuration();
+        logger.info("[Clean-{}]: begin", id);
         boolean hasError = false;
         for (String filePath : filePathList) {
-            try{
-                if (filePath.startsWith(HDFS_URI_PREFIX) || filePath.startsWith(S3_URI_PREFIX)) {
-                    deleteHdfsFile(filePath, hdfsConfig);
-                } else if (filePath.startsWith("file:/")) {
-                        URI uri = new URI(filePath);
-                        String actualPath = new File(uri.getPath()).getAbsolutePath();
-                        deleteLocalFile(actualPath);
-                } else {
-                    deleteLocalFile(filePath);
-                }
-            }
-            catch (URISyntaxException e) {
-                e.printStackTrace();
+            try {
+                deleteByFlinkFS(filePath);
+            } catch (Exception e) {
                 hasError = true;
-                logger.info("无法解析文件URI: {}", filePath);
-                logger.info("[Clean-{}]: fail",id);
-            }
-            catch (IOException e) {
-                hasError = true;
-                e.printStackTrace();
-                logger.info("[Clean-{}]: fail",id);
+                logger.error("[Clean-{}]: fail to delete path: {}", id, filePath, e);
             }
         }
         if (!hasError) {
-            logger.info("[Clean-{}]: success",id);
+            logger.info("[Clean-{}]: success", id);
         }
+        return !hasError;
     }
 
-    private void deleteHdfsFile(String filePath, Configuration hdfsConfig) throws IOException {
-        try {
-            FileSystem fs = FileSystem.get(URI.create(filePath), hdfsConfig);
-            Path path = new Path(filePath);
-            if (fs.exists(path)) {
-                // false 表示不递归删除
-                fs.delete(path, false);
-                logger.info("=============================HDFS/s3 文件已删除: {}", filePath);
-                deleteEmptyParentDirectories(fs, path.getParent());
-                fs.close();
-            } else {
-                logger.info("=============================HDFS/s3 文件不存在: {}", filePath);
+    private void deleteByFlinkFS(String filePath) throws IOException {
+        Path path = new Path(filePath);
+        URI uri = path.toUri();
+        FileSystem fs = path.getFileSystem();
+        if (fs.exists(path)) {
+            // false: delete a single file only (non-recursive)
+            boolean deleted = fs.delete(path, false);
+            if (!deleted) {
+                throw new IOException("Flink FS returned false when deleting: " + filePath);
             }
-        } catch (IOException e) {
-            e.printStackTrace();
-            logger.error("=============================删除 HDFS/s3 文件失败: {}", filePath);
-            throw new IOException(filePath + "fail to delete");
-        }
-    }
-
-    private void deleteLocalFile(String filePath) throws IOException {
-        File file = new File(filePath);
-        if (file.exists()) {
-            if (file.delete()) {
-                logger.info("本地文件已删除：{}", filePath);
-                deleteEmptyParentDirectories(file.getParentFile());
-            } else {
-                logger.info("本地文件删除失败: {}", filePath);
-                throw new IOException(file + "fail to delete");
-            }
+            logger.info("=============================Flink FS 文件已删除: {} (scheme={})", filePath, uri.getScheme());
         } else {
-            logger.info("=============================本地文件不存在: {}", filePath);
-            throw new IOException(file + "not found");
+            logger.info("=============================Flink FS 文件不存在: {} (scheme={})", filePath, uri.getScheme());
         }
     }
 
@@ -208,52 +172,75 @@ public class CleanUtils {
     }
 
 
-    public void deleteFileAndDataCommitInfo(List<String> snapshot, String tableId, String partitionDesc, Connection connection, Boolean oldCompaction) {
-        snapshot.forEach(commitId -> {
-                    if (oldCompaction) {
-                        logger.info("清理旧版压缩数据");
-                        String sql = "SELECT \n" +
-                                "    dci.table_id, \n" +
-                                "    dci.partition_desc, \n" +
-                                "    dci.commit_id, \n" +
-                                "    file_op.path \n" +
-                                "FROM \n" +
-                                "    data_commit_info dci, \n" +
-                                "    unnest(dci.file_ops) AS file_op \n" +
-                                "WHERE \n" +
-                                "    dci.table_id = '" + tableId + "' \n" +
-                                "    AND dci.partition_desc = '" + partitionDesc + "' \n" +
-                                "    AND dci.commit_id = '" + commitId + "'";
-                        try (PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
-                            // 执行删除操作
-                            ResultSet pathSet = preparedStatement.executeQuery();
-                            logger.info(sql);
-                            List<String> oldCompactionFileList = new ArrayList<>();
-                            while (pathSet.next()) {
-                                String path = pathSet.getString("path");
-                                oldCompactionFileList.add(path);
-                            }
-                            if (!oldCompactionFileList.isEmpty()){
-                                deleteFile(oldCompactionFileList);
-                            }
-                        } catch (SQLException e) {
-                            // 处理SQL异常
-                            e.printStackTrace();
-
+    /**
+     * Delete files (if needed) and then delete PG metadata.
+     * Consistency rule: only delete metadata if file deletions succeed.
+     *
+     * @return true if all commits in snapshot are cleaned successfully; false otherwise.
+     */
+    public boolean deleteFileAndDataCommitInfo(List<String> snapshot,
+                                              String tableId,
+                                              String partitionDesc,
+                                              Connection connection,
+                                              Boolean oldCompaction) {
+        boolean allOk = true;
+        for (String commitId : snapshot) {
+            boolean commitOk = true;
+            if (Boolean.TRUE.equals(oldCompaction)) {
+                logger.info("清理旧版压缩数据");
+                String sql = "SELECT \n" +
+                        "    dci.table_id, \n" +
+                        "    dci.partition_desc, \n" +
+                        "    dci.commit_id, \n" +
+                        "    file_op.path \n" +
+                        "FROM \n" +
+                        "    data_commit_info dci, \n" +
+                        "    unnest(dci.file_ops) AS file_op \n" +
+                        "WHERE \n" +
+                        "    dci.table_id = '" + tableId + "' \n" +
+                        "    AND dci.partition_desc = '" + partitionDesc + "' \n" +
+                        "    AND dci.commit_id = '" + commitId + "'";
+                try (PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
+                    ResultSet pathSet = preparedStatement.executeQuery();
+                    logger.info(sql);
+                    List<String> oldCompactionFileList = new ArrayList<>();
+                    while (pathSet.next()) {
+                        String path = pathSet.getString("path");
+                        oldCompactionFileList.add(path);
+                    }
+                    if (!oldCompactionFileList.isEmpty()) {
+                        boolean deleted = deleteFile(oldCompactionFileList);
+                        if (!deleted) {
+                            commitOk = false;
+                            logger.warn("旧版压缩文件删除失败，跳过删除元数据。tableId={}, partitionDesc={}, commitId={}",
+                                    tableId, partitionDesc, commitId);
                         }
                     }
-                    String deleteDataCommitInfoSql = "DELETE FROM data_commit_info \n" +
-                            "WHERE table_id = '" + tableId + "' \n" +
-                            "AND commit_id = '" + commitId + "' \n" +
-                            "AND partition_desc = '" + partitionDesc + "'";
-                    try (PreparedStatement preparedStatement = connection.prepareStatement(deleteDataCommitInfoSql)) {
-                        logger.info(deleteDataCommitInfoSql);
-                        preparedStatement.executeUpdate();
-                    } catch (SQLException e) {
-                        throw new RuntimeException(e);
-                    }
+                } catch (SQLException e) {
+                    commitOk = false;
+                    logger.error("查询 data_commit_info.file_ops 失败，跳过删除元数据。tableId={}, partitionDesc={}, commitId={}",
+                            tableId, partitionDesc, commitId, e);
                 }
-        );
+            }
+
+            if (commitOk) {
+                String deleteDataCommitInfoSql = "DELETE FROM data_commit_info \n" +
+                        "WHERE table_id = '" + tableId + "' \n" +
+                        "AND commit_id = '" + commitId + "' \n" +
+                        "AND partition_desc = '" + partitionDesc + "'";
+                try (PreparedStatement preparedStatement = connection.prepareStatement(deleteDataCommitInfoSql)) {
+                    logger.info(deleteDataCommitInfoSql);
+                    preparedStatement.executeUpdate();
+                } catch (SQLException e) {
+                    commitOk = false;
+                    logger.error("删除 data_commit_info 失败。tableId={}, partitionDesc={}, commitId={}",
+                            tableId, partitionDesc, commitId, e);
+                }
+            }
+
+            allOk = allOk && commitOk;
+        }
+        return allOk;
     }
 
     public void cleanDiscardFile(long expiredTime, Connection connection) throws SQLException {
@@ -270,41 +257,20 @@ public class CleanUtils {
             selectStmt.setLong(1, currentTimeMillis - expiredTime);
             ResultSet resultSet = selectStmt.executeQuery();
 
-            List<String> pathList = new ArrayList<>();
-
             while (resultSet.next()) {
                 String filePath = resultSet.getString("file_path");
-                deleteStmt.setString(1, filePath);
-                deleteStmt.executeUpdate();
-                pathList.add(filePath);
-            }
-            deleteFile(pathList);
-        }
-
-    }
-
-    private void deleteEmptyParentDirectories(FileSystem fs, Path directory) throws IOException {
-        if (directory == null) {
-            return;
-        }
-        // 检查目录是否为空
-        if (fs.listStatus(directory).length == 0) {
-            fs.delete(directory, false); // 删除空目录
-            deleteEmptyParentDirectories(fs, directory.getParent());
-        }
-    }
-
-    private void deleteEmptyParentDirectories(File directory) {
-        if (directory == null) {
-            return; // 根目录不需要处理
-        }
-        // 检查目录是否为空
-        if (Objects.requireNonNull(directory.list()).length == 0) {
-            if (directory.delete()) {
-                deleteEmptyParentDirectories(directory.getParentFile());
+                boolean ok = deleteFile(Collections.singletonList(filePath));
+                if (ok) {
+                    deleteStmt.setString(1, filePath);
+                    deleteStmt.executeUpdate();
+                } else {
+                    logger.warn("discard_compressed_file_info 文件删除失败，保留元数据以便重试: {}", filePath);
+                }
             }
         }
+
     }
+
 
     public String[] parseFileOpsString(String fileOPs) {
         String[] fileInfo = new String[2];
