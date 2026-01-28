@@ -53,5 +53,11 @@ public class LakeSoulDDLSinkOptions extends LakeSoulSinkOptions{
             .defaultValue("")
             .withDescription("list of source database excluded tables. Comma-Separated string");
 
+    public static final ConfigOption<String> SOURCE_DB_INCLUDE_TABLES = ConfigOptions
+            .key("source_db.include_tables")
+            .stringType()
+            .defaultValue("")
+            .withDescription("list of source database included tables. Comma-Separated string. If set, only these tables will be captured (no regex). Supports `table` or `db.table`.");
+
 
 }
