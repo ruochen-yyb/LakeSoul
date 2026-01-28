@@ -19,7 +19,6 @@ import org.apache.flink.lakesoul.types.BinarySourceRecordSerializer;
 import org.apache.flink.lakesoul.types.LakeSoulRecordConvert;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
@@ -77,8 +76,6 @@ public class MysqlCdc {
                                 bucketParallelism,
                                 true);
 
-                mysqlDBManager.importOrSyncLakeSoulNamespace(dbName);
-
                 Configuration conf = new Configuration();
 
                 // parameters for mutil tables ddl sink
@@ -100,6 +97,43 @@ public class MysqlCdc {
                 conf.set(LakeSoulSinkOptions.BUCKET_PARALLELISM, bucketParallelism);
                 conf.set(LakeSoulSinkOptions.HASH_BUCKET_NUM, bucketParallelism);
                 conf.set(ExecutionCheckpointingOptions.ENABLE_CHECKPOINTS_AFTER_TASKS_FINISH, true);
+
+                // naming rules for target namespace / table name
+                // - keep unified option names (naming.*)
+                // - if user sets naming.target_namespace or naming.table_format without
+                // naming.enable,
+                // auto-enable naming to make them effective
+                boolean hasNamingEnable = parameter.has(LakeSoulSinkOptions.NAMING_ENABLE.key());
+                boolean hasNamingDetails = parameter.has(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE.key())
+                                || parameter.has(LakeSoulSinkOptions.NAMING_TABLE_FORMAT.key())
+                                || parameter.has(LakeSoulSinkOptions.NAMING_CASE.key());
+                if (hasNamingEnable) {
+                        conf.set(LakeSoulSinkOptions.NAMING_ENABLE,
+                                        Boolean.parseBoolean(parameter.get(LakeSoulSinkOptions.NAMING_ENABLE.key())));
+                } else if (hasNamingDetails) {
+                        conf.set(LakeSoulSinkOptions.NAMING_ENABLE, true);
+                }
+                if (parameter.has(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE.key())) {
+                        conf.set(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE,
+                                        parameter.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE.key()));
+                }
+                if (parameter.has(LakeSoulSinkOptions.NAMING_TABLE_FORMAT.key())) {
+                        conf.set(LakeSoulSinkOptions.NAMING_TABLE_FORMAT,
+                                        parameter.get(LakeSoulSinkOptions.NAMING_TABLE_FORMAT.key()));
+                }
+                if (parameter.has(LakeSoulSinkOptions.NAMING_CASE.key())) {
+                        conf.set(LakeSoulSinkOptions.NAMING_CASE,
+                                        parameter.get(LakeSoulSinkOptions.NAMING_CASE.key()));
+                }
+
+                // ensure target namespace exists in LakeSoul
+                String targetNamespace = dbName;
+                if (conf.getBoolean(LakeSoulSinkOptions.NAMING_ENABLE)
+                                && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null
+                                && !conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE).isEmpty()) {
+                        targetNamespace = conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE);
+                }
+                mysqlDBManager.importOrSyncLakeSoulNamespace(targetNamespace);
 
                 StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(conf);
                 env.getConfig().registerTypeWithKryoSerializer(BinarySourceRecord.class,
@@ -151,7 +185,7 @@ public class MysqlCdc {
                 LakeSoulRecordConvert lakeSoulRecordConvert = new LakeSoulRecordConvert(conf,
                                 conf.getString(SERVER_TIME_ZONE));
                 sourceBuilder.deserializer(new BinaryDebeziumDeserializationSchema(lakeSoulRecordConvert,
-                                conf.getString(WAREHOUSE_PATH)));
+                                conf.getString(WAREHOUSE_PATH), conf));
                 Properties jdbcProperties = new Properties();
                 jdbcProperties.put("allowPublicKeyRetrieval", "true");
                 jdbcProperties.put("useSSL", "false");
@@ -166,7 +200,7 @@ public class MysqlCdc {
                 DataStreamSource<BinarySourceRecord> source = builder.buildMultiTableSource("MySQL Source");
 
                 DataStream<BinarySourceRecord> stream = builder.buildHashPartitionedCDCStream(source);
-                DataStreamSink<BinarySourceRecord> dmlSink = builder.buildLakeSoulDMLSink(stream);
+                builder.buildLakeSoulDMLSink(stream);
                 env.execute("LakeSoul CDC Sink From MySQL Database " + dbName);
         }
 
