@@ -42,6 +42,12 @@ import static org.apache.flink.lakesoul.tool.JobOptions.JOB_CHECKPOINT_INTERVAL;
 import static org.apache.flink.lakesoul.tool.JobOptions.JOB_CHECKPOINT_MODE;
 import static org.apache.flink.lakesoul.tool.LakeSoulDDLSinkOptions.*;
 
+/**
+ * @deprecated Use {@link JdbcCDC} with {@code --source_db.db_type mysql}.
+ *             This entry will be kept for backward compatibility, but new jobs
+ *             should use {@link JdbcCDC}.
+ */
+@Deprecated
 public class MysqlCdc {
 
         public static void main(String[] args) throws Exception {

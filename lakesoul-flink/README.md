@@ -2,15 +2,17 @@
 
 ### Mysql CDC 多表同步（白名单 / 黑名单）
 
-`MysqlCdc` 入口支持通过**显式表清单**控制捕获范围（不使用正则表达式；参数为逗号分隔表名）。
+`JdbcCDC` 入口（`--source_db.db_type mysql`）支持通过**显式表清单**控制捕获范围（不使用正则表达式；参数为逗号分隔表名）。
 
 - **白名单**：只同步指定表
 - **黑名单**：排除指定表
 - **同时配置**：最终表集合 = 白名单 - 黑名单
 
+说明：旧入口 `MysqlCdc` 已标注弃用（仅为兼容保留），后续建议统一使用 `JdbcCDC`。
+
 ### 入湖命名规范（目标库名 / 表名前缀）
 
-`MysqlCdc` 支持通过现有的 `naming.*` 参数统一规范入湖的 **namespace（库名）** 和 **表名**：
+`JdbcCDC`（mysql 分支）支持通过现有的 `naming.*` 参数统一规范入湖的 **namespace（库名）** 和 **表名**：
 
 - **`--naming.enable`**：开启命名规则（可选；若仅配置了 `naming.target_namespace` / `naming.table_format`，也会自动启用）
 - **`--naming.target_namespace`**：目标入湖库名（namespace）
@@ -28,7 +30,8 @@
 - **只同步指定表（白名单）**
 
 ```bash
-flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink-*.jar \
+flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink-*.jar \
+  --source_db.db_type mysql \
   --source_db.db_name mydb \
   --source_db.user root \
   --source_db.password 123456 \
@@ -44,7 +47,8 @@ flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink-*.jar \
 - **同步全库但排除部分表（黑名单）**
 
 ```bash
-flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink-*.jar \
+flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink-*.jar \
+  --source_db.db_type mysql \
   --source_db.db_name mydb \
   --source_db.user root \
   --source_db.password 123456 \
@@ -60,7 +64,8 @@ flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink-*.jar \
 - **规范入湖库名 + 表名前缀（千表同步场景）**
 
 ```bash
-flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink-*.jar \
+flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink-*.jar \
+  --source_db.db_type mysql \
   --source_db.db_name mydb \
   --source_db.user root \
   --source_db.password 123456 \
@@ -73,4 +78,33 @@ flink run -c org.apache.flink.lakesoul.entry.MysqlCdc lakesoul-flink-*.jar \
   --naming.target_namespace ods \
   --naming.table_format mysql_{table} \
   --naming.case lower
+```
+
+### MongoDB CDC 多表同步
+
+`JdbcCDC` 入口（`--source_db.db_type mongodb`）会基于 `MongoDBSource` 构建 CDC Source，并将变更写入 LakeSoul。
+
+#### 参数
+
+- **`--source_db.schema_tables`**：逗号分隔的 collection 列表（会原样传给 `MongoDBSource.collectionList(...)`）。建议使用 `db.collection` 形式。
+- **`--source_db.host`**：传给 `MongoDBSource.hosts(...)`；建议写成 `host:port`（如 `127.0.0.1:27017`）。
+- **`--batchSize`**：Mongo source 的 batch size（对应 key=`batchSize`）。
+
+#### 示例
+
+```bash
+flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink-*.jar \
+  --source_db.db_type mongodb \
+  --source_db.db_name mydb \
+  --source_db.user myuser \
+  --source_db.password 'mypassword' \
+  --source_db.host '127.0.0.1:27017' \
+  --source_db.schema_tables 'mydb.collection1,mydb.collection2' \
+  --batchSize 1024 \
+  --warehouse_path file:///tmp/lakesoul \
+  --server_time_zone Asia/Shanghai \
+  --source_parallelism 4 \
+  --bucket_parallelism 4 \
+  --flink.checkpoint file:///tmp/flink-checkpoints \
+  --job.checkpoint_interval 600000
 ```
