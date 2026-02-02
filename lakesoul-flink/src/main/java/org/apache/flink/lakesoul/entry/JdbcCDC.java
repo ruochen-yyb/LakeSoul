@@ -594,12 +594,13 @@ public class JdbcCDC {
                         conf.getString(WAREHOUSE_PATH), conf))
                 .build();
         NameSpaceManager manager = new NameSpaceManager();
+        String targetNamespace = dbName;
         if (conf.getBoolean(LakeSoulSinkOptions.NAMING_ENABLE)
-                && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null) {
-            manager.importOrSyncLakeSoulNamespace(conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE));
-        } else {
-            manager.importOrSyncLakeSoulNamespace(dbName);
+                && conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE) != null
+                && !conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE).isEmpty()) {
+            targetNamespace = conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE);
         }
+        manager.importOrSyncLakeSoulNamespace(targetNamespace);
         LakeSoulMultiTableSinkStreamBuilder.Context context = new LakeSoulMultiTableSinkStreamBuilder.Context();
         context.env = env;
         context.conf = (Configuration) env.getConfiguration();

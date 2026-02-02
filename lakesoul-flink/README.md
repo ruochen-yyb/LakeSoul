@@ -89,6 +89,7 @@ flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink-*.jar \
 - **`--source_db.schema_tables`**：逗号分隔的 collection 列表（会原样传给 `MongoDBSource.collectionList(...)`）。建议使用 `db.collection` 形式。
 - **`--source_db.host`**：传给 `MongoDBSource.hosts(...)`；建议写成 `host:port`（如 `127.0.0.1:27017`）。
 - **`--batchSize`**：Mongo source 的 batch size（对应 key=`batchSize`）。
+- **入湖命名规范（同 MySQL）**：支持 `naming.*`（`target_namespace/table_format/case`）。其中 MongoDB 场景 `{db}`=database，`{table}`=collection。
 
 #### 示例
 
@@ -105,6 +106,28 @@ flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink-*.jar \
   --server_time_zone Asia/Shanghai \
   --source_parallelism 4 \
   --bucket_parallelism 4 \
+  --flink.checkpoint file:///tmp/flink-checkpoints \
+  --job.checkpoint_interval 600000
+```
+
+- **规范入湖库名 + 表名前缀（MongoDB 场景）**
+
+```bash
+flink run -c org.apache.flink.lakesoul.entry.JdbcCDC lakesoul-flink-*.jar \
+  --source_db.db_type mongodb \
+  --source_db.db_name mydb \
+  --source_db.user myuser \
+  --source_db.password 'mypassword' \
+  --source_db.host '127.0.0.1:27017' \
+  --source_db.schema_tables 'mydb.collection1,mydb.collection2' \
+  --batchSize 1024 \
+  --warehouse_path file:///tmp/lakesoul \
+  --server_time_zone Asia/Shanghai \
+  --source_parallelism 4 \
+  --bucket_parallelism 4 \
+  --naming.target_namespace ods \
+  --naming.table_format mongo_{table} \
+  --naming.case lower \
   --flink.checkpoint file:///tmp/flink-checkpoints \
   --job.checkpoint_interval 600000
 ```

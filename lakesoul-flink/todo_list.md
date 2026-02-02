@@ -61,3 +61,19 @@
 - [x] 11.1 基于 `JdbcCDC#mongoCdc` 确认必须参数与默认行为（`db_type/db_name/host/schema_tables/batchSize` 等）
 - [x] 11.2 产出一条可直接运行的 `flink run -c org.apache.flink.lakesoul.entry.JdbcCDC ...` 示例命令（含 checkpoint、并行度、warehouse_path）
 - [x] 11.3 更新根目录 `README.md`：新增 “MongoDB CDC 多表同步” 小节与示例
+
+---
+
+## 12. MongoDB CDC 入湖命名规范：支持指定规范库名与表名前缀（沿用 naming.*）
+
+- [x] 12.1 行为确认
+  - 目标入湖库名：`--naming.target_namespace`（可选；不配则沿用源库/库名）
+  - 表名前缀：`--naming.table_format "prefix_{table}"`（MongoDB 场景 `{db}`=database，`{table}`=collection）
+  - 大小写：`--naming.case preserve|lower|upper`
+  - 自动启用：若只配置 `naming.target_namespace` / `naming.table_format` / `naming.case`，则自动 `naming.enable=true`
+
+- [x] 12.2 代码落地
+  - 对齐 `JdbcCDC#mongoCdc` 的 namespace 同步逻辑：与 mysql/postgres/oracle 分支一致（空字符串保护；不配 target_namespace 时默认使用源库名）
+
+- [x] 12.3 文档更新
+  - `README.md`：补充 MongoDB 场景同样支持 `naming.*`，并增加一个“规范入湖库名 + 表名前缀”的示例命令
