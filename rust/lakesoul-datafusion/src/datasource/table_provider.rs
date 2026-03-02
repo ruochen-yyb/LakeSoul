@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaBuilder, SchemaRef};
+use arrow::error::ArrowError;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{Constraint, Statistics, ToDFSchema, project_schema};
@@ -19,8 +20,12 @@ use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl, PartitionedFile};
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileSinkConfig};
-use datafusion::error::{DataFusionError, Result};
+use datafusion::datasource::physical_plan::{
+    FileGroup, FileScanConfig, FileScanConfigBuilder, FileSinkConfig,
+};
+use datafusion::datasource::source::DataSource;
+use datafusion::datasource::table_schema::TableSchema;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::Sort;
 use datafusion::logical_expr::utils::conjunction;
@@ -35,12 +40,15 @@ use datafusion::{execution::context::SessionState, logical_expr::Expr};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 
+use lakesoul_io::config::LakeSoulIOConfig;
 use lakesoul_io::helpers::listing_table_from_lakesoul_io_config;
-use lakesoul_io::lakesoul_io_config::LakeSoulIOConfig;
 use lakesoul_metadata::MetaDataClientRef;
 use lakesoul_metadata::utils::qualify_path;
 use proto::proto::entity::TableInfo;
+use rootcause::compat::boxed_error::IntoBoxedError;
+use rootcause::report;
 
+use crate::Result;
 use crate::catalog::{
     LakeSoulTableProperty, format_table_info_partitions, parse_table_info_partitions,
 };
@@ -74,8 +82,8 @@ pub struct LakeSoulTableProvider {
     pub(crate) file_schema: SchemaRef,
     pub(crate) primary_keys: Vec<String>,
     pub(crate) range_partitions: Vec<String>,
+    pub(crate) pushdown_filters: bool,
 }
-
 impl LakeSoulTableProvider {
     pub async fn try_new(
         session_state: &SessionState,
@@ -83,7 +91,7 @@ impl LakeSoulTableProvider {
         lakesoul_io_config: LakeSoulIOConfig,
         table_info: Arc<TableInfo>,
         as_sink: bool,
-    ) -> crate::error::Result<Self> {
+    ) -> Result<Self> {
         let table_schema = schema_from_metadata_str(&table_info.table_schema);
         let (range_partitions, hash_partitions) =
             parse_table_info_partitions(&table_info.partitions)?;
@@ -93,8 +101,8 @@ impl LakeSoulTableProvider {
         // O(nm), n = number of table fields, m = number of range partitions
         for (idx, field) in table_schema.fields().iter().enumerate() {
             match range_partitions.contains(field.name()) {
-                false => file_schema_projection.push(idx),
                 true => range_partition_projection.push(idx),
+                false => file_schema_projection.push(idx),
             };
         }
 
@@ -141,14 +149,15 @@ impl LakeSoulTableProvider {
             file_schema,
             primary_keys: hash_partitions,
             range_partitions,
+            pushdown_filters: lakesoul_io_config.parquet_pushdown_filters(), // TODO after add more format
         })
     }
 
     pub async fn new_from_create_external_table(
-        _session_state: &dyn Session,
+        session_state: &dyn Session,
         client: MetaDataClientRef,
         cmd: &CreateExternalTable,
-    ) -> crate::error::Result<Self> {
+    ) -> Result<Self> {
         let primary_keys = cmd
             .constraints
             .iter()
@@ -163,8 +172,8 @@ impl LakeSoulTableProvider {
 
         let range_partitions = cmd.table_partition_cols.clone();
 
-        info!(
-            "LakeSoulTableProvider::new_from_create_external_table cmd.options: {:?}",
+        debug!(
+            "LakeSoulTableProvider::new_from_create_external_table cmd.options: {:#?}",
             cmd.options
         );
 
@@ -211,7 +220,13 @@ impl LakeSoulTableProvider {
                 hash_bucket_num: if primary_keys.is_empty() {
                     None
                 } else {
-                    Some(String::from("4"))
+                    // TODO: 4 should be parameter
+                    Some(
+                        cmd.options
+                            .get("hash_bucket_num")
+                            .cloned()
+                            .unwrap_or(String::from("4")),
+                    )
                 },
                 cdc_change_column: cdc_column,
                 use_cdc,
@@ -242,6 +257,11 @@ impl LakeSoulTableProvider {
             file_schema,
             primary_keys,
             range_partitions,
+            pushdown_filters: session_state
+                .config_options()
+                .execution
+                .parquet
+                .pushdown_filters, // TODO after more format
         })
     }
 
@@ -249,7 +269,7 @@ impl LakeSoulTableProvider {
         self.client.clone()
     }
 
-    fn primary_keys(&self) -> &[String] {
+    fn _primary_keys(&self) -> &[String] {
         &self.primary_keys
     }
 
@@ -257,11 +277,11 @@ impl LakeSoulTableProvider {
         self.table_info.clone()
     }
 
-    fn table_name(&self) -> &str {
+    fn _table_name(&self) -> &str {
         &self.table_info.table_name
     }
 
-    fn table_namespace(&self) -> &str {
+    fn _table_namespace(&self) -> &str {
         &self.table_info.table_namespace
     }
 
@@ -319,8 +339,10 @@ impl LakeSoulTableProvider {
                         ))
                     }
                 })
-                .collect::<Result<Vec<_>>>()?;
-            all_sort_orders.push(LexOrdering::new(sort_exprs));
+                .collect::<Result<Vec<_>,DataFusionError>>()?;
+            if let Some(ordering) = LexOrdering::new(sort_exprs) {
+                all_sort_orders.push(ordering);
+            }
         }
         Ok(all_sort_orders)
     }
@@ -341,16 +363,7 @@ impl LakeSoulTableProvider {
             .client
             .get_all_partition_info(self.table_id())
             .await
-            .map_err(|e| {
-                DataFusionError::External(
-                    format!(
-                        "get all partition_info of table {} failed: {}",
-                        &self.table_info().table_name,
-                        e
-                    )
-                    .into(),
-                )
-            })?;
+            .map_err(|e| report!(e).attach(self.table_info().table_name.clone()))?;
         let partition_filters = filters
             .iter()
             .filter(|f| self.is_partition_filter(f))
@@ -363,15 +376,7 @@ impl LakeSoulTableProvider {
             self.table_partition_cols(),
         )
         .await
-        .map_err(|_| {
-            DataFusionError::External(
-                format!(
-                    "prune partitions for all partitions of table {} failed",
-                    &self.table_info().table_name
-                )
-                .into(),
-            )
-        })?;
+        .map_err(|report| report.attach(self.table_info().table_name.clone()))?;
 
         info!("prune_partition_info: {:?}", prune_partition_info);
 
@@ -398,7 +403,7 @@ impl LakeSoulTableProvider {
                 .map(|(parsed, (_, datatype))| {
                     ScalarValue::try_from_string(parsed.to_string(), datatype)
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
 
             let files = object_metas
                 .into_iter()
@@ -413,7 +418,7 @@ impl LakeSoulTableProvider {
                 .collect::<Vec<_>>();
             file_groups.push(files)
         }
-        info!("file_groups: {:?}", file_groups);
+        debug!("file_groups: {:#?}", file_groups);
 
         Ok((file_groups, Statistics::new_unknown(self.schema().deref())))
     }
@@ -437,16 +442,17 @@ impl TableProvider for LakeSoulTableProvider {
         &self,
         session_state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        filters: &[Expr], // TODO
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let session_state = session_state
             .as_any()
             .downcast_ref::<SessionState>()
             .unwrap();
         let (partitioned_file_lists, statistics) = self
             .list_files_for_scan(session_state, filters, limit)
-            .await?;
+            .await
+            .map_err(|report| DataFusionError::External(report.into_boxed_error()))?;
 
         // if no files need to be read, return an `EmptyExec`
         if partitioned_file_lists.is_empty() {
@@ -461,21 +467,18 @@ impl TableProvider for LakeSoulTableProvider {
             .options()
             .table_partition_cols
             .iter()
-            .map(|col| Ok(self.schema().field_with_name(&col.0)?.clone()))
-            .collect::<Result<Vec<_>>>()?;
-
-        let filters = if let Some(expr) = conjunction(filters.to_vec()) {
-            // NOTE: Use the table schema (NOT file schema) here because `expr` may contain references to partition columns.
-            let table_df_schema = self.schema().as_ref().clone().to_dfschema()?;
-            let filters = create_physical_expr(
-                &expr,
-                &table_df_schema,
-                session_state.execution_props(),
-            )?;
-            Some(filters)
-        } else {
-            None
-        };
+            .map(|col| Ok(Arc::new(self.schema().field_with_name(&col.0)?.clone())))
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        // TODO change logic when datafusion 52
+        let table_schema =
+            TableSchema::new(self.file_schema.clone(), table_partition_cols.clone());
+        let statistics = Arc::new(statistics);
+        let file_source = self
+            .options()
+            .format
+            .file_source()
+            .with_statistics(Statistics::new_unknown(&self.schema()))
+            .with_schema(table_schema.clone());
 
         let object_store_url = if let Some(url) = self.table_paths().first() {
             url.object_store()
@@ -483,57 +486,99 @@ impl TableProvider for LakeSoulTableProvider {
             return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
         };
 
+        let mut scan_config = FileScanConfigBuilder::new(
+            object_store_url,
+            table_schema.file_schema().clone(), // TODO: change logic when datafusion 52
+            file_source,
+        )
+        .with_file_groups(
+            partitioned_file_lists
+                .into_iter()
+                .map(|files| FileGroup::new(files).with_statistics(statistics.clone()))
+                .collect(),
+        )
+        .with_projection_indices(projection.cloned())
+        .with_limit(limit)
+        .with_newlines_in_values(false)
+        .with_output_ordering(
+            self.try_create_output_ordering()
+                .map_err(|report| DataFusionError::External(report.into_boxed_error()))?,
+        )
+        .with_table_partition_cols(
+            table_partition_cols
+                .into_iter()
+                .map(|field_ref| field_ref.as_ref().clone())
+                .collect(),
+        )
+        .with_file_compression_type(FileCompressionType::ZSTD) // TODO CONF;
+        .build();
+
+        if let Some(expr) = conjunction(filters.to_vec()) {
+            // NOTE: Use the table schema (NOT file schema) here because `expr` may contain references to partition columns.
+            let table_df_schema = self.schema().as_ref().clone().to_dfschema()?;
+            let filter = create_physical_expr(
+                &expr,
+                &table_df_schema,
+                session_state.execution_props(),
+            )?;
+
+            let res = scan_config
+                .try_pushdown_filters(vec![filter], session_state.config_options())?;
+            match res.updated_node {
+                Some(sc) => {
+                    debug!("apply new scan config");
+                    debug!("filters: {:?}", res.filters);
+                    scan_config = sc
+                        .as_any()
+                        .downcast_ref::<FileScanConfig>()
+                        .ok_or(DataFusionError::Internal(
+                            "Failed to downcast FileScanConfig".into(),
+                        ))?
+                        .clone();
+                }
+                None => {
+                    debug!("no updated node")
+                }
+            }
+        }
         // create the execution plan
-        let statistics = Arc::new(statistics);
-        let file_source = self
-            .options()
-            .format
-            .file_source()
-            .with_statistics(Statistics::new_unknown(&self.schema()));
         self.options()
             .format
-            .create_physical_plan(
-                session_state,
-                FileScanConfig {
-                    object_store_url,
-                    file_schema: self.schema(),
-                    file_groups: partitioned_file_lists
-                        .into_iter()
-                        .map(|files| {
-                            FileGroup::new(files).with_statistics(statistics.clone())
-                        })
-                        .collect(),
-                    constraints: Default::default(),
-                    // projection for Table instead of File
-                    projection: projection.cloned(),
-                    limit,
-                    output_ordering: self.try_create_output_ordering()?,
-                    file_compression_type: FileCompressionType::ZSTD,
-                    new_lines_in_values: false,
-                    file_source,
-                    table_partition_cols,
-                    batch_size: None,
-                },
-                filters.as_ref(),
-            )
+            .create_physical_plan(session_state, scan_config)
             .await
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         info!("supports_filters_pushdown: {:?}", filters);
-        filters
-            .iter()
-            .map(|f| {
-                if self.is_partition_filter(f) {
-                    Ok(TableProviderFilterPushDown::Exact)
-                } else {
-                    Ok(TableProviderFilterPushDown::Unsupported)
-                }
-            })
-            .collect()
+
+        if !self.pushdown_filters {
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
+
+        if self.primary_keys.is_empty() {
+            // TODO session config -> io_config / config.parquet support filter pushdown
+            Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        } else {
+            // O(nml), n = number of filters, m = number of primary keys, l = number of columns
+            filters
+                .iter()
+                .map(|f| {
+                    let cols = f.column_refs();
+                    if cols.iter().all(|col| self.primary_keys.contains(&col.name)) {
+                        // use primary key
+                        Ok(TableProviderFilterPushDown::Inexact)
+                    } else {
+                        Ok(TableProviderFilterPushDown::Unsupported)
+                    }
+                })
+                .collect()
+        }
     }
 
     #[instrument(skip(self, state))]
@@ -542,18 +587,8 @@ impl TableProvider for LakeSoulTableProvider {
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Get the object store for the table path.
-        // let url = Url::parse(table_path.as_str()).unwrap();
-        // let _store = state.runtime_env().object_store(ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?);
-        // dbg!(&_store);
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let state = state.as_any().downcast_ref::<SessionState>().unwrap();
-
-        // let file_type_writer_options = match &self.options().file_type_write_options {
-        //     Some(opt) => opt.clone(),
-        //     None => FileTypeWriterOptions::build_default(&file_format.file_type(), state.config_options())?,
-        // };
-
         // Sink related option, apart from format
         let config = FileSinkConfig {
             original_url: "".to_string(),

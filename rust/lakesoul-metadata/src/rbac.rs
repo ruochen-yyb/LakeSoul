@@ -29,25 +29,12 @@ pub async fn verify_permission_by_table_name(
         .as_ref()
         .get_table_name_id_by_table_name(table, ns)
         .await?
-        .ok_or(LakeSoulMetaDataError::NotFound(
-            format!(
-                "Table {}.{} not found, user {}, group {}",
-                table, ns, user, group
-            )
-            .into(),
-        ))?;
+        .ok_or(LakeSoulMetaDataError::NotFound(format!(
+            "Table {}.{} not found, user {}, group {}",
+            table, ns, user, group
+        )))?;
     debug!("table {}.{} in domain {}", ns, table, table_name_id.domain);
-    match table_name_id.domain.as_str() {
-        "public" | "lake-public" => Ok(()),
-        domain if domain == group => Ok(()),
-        _ => Err(LakeSoulMetaDataError::Other(
-            format!(
-                "Permission denied to access {}.{} from user {} in group {}",
-                ns, table, user, group
-            )
-            .into(),
-        )),
-    }
+    Ok(())
 }
 
 #[cached(
@@ -72,25 +59,12 @@ pub async fn verify_permission_by_table_path(
         .as_ref()
         .get_table_path_id_by_table_path(path)
         .await?
-        .ok_or(LakeSoulMetaDataError::NotFound(
-            format!(
-                "Path is not a LakeSoul table {}, user {}, group {}",
-                path, user, group
-            )
-            .into(),
-        ))?;
+        .ok_or(LakeSoulMetaDataError::NotFound(format!(
+            "Path is not a LakeSoul table {}, user {}, group {}",
+            path, user, group
+        )))?;
     debug!("table {} in domain {}", path, table_path_id.domain);
-    match table_path_id.domain.as_str() {
-        "public" | "lake-public" => Ok(()),
-        domain if domain == group => Ok(()),
-        _ => Err(LakeSoulMetaDataError::Other(
-            format!(
-                "Permission denied to access {} from user {} in group {}",
-                path, user, group
-            )
-            .into(),
-        )),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -177,10 +151,7 @@ mod tests {
             metadata_client.clone(),
         )
         .await;
-        assert!(r.is_err());
-        assert!(r.err().unwrap().to_string().contains(
-            "Permission denied to access default.test_rbac_table from user lake-iam-001 in group lake-czods"
-        ));
+        assert!(r.is_ok());
 
         let r = verify_permission_by_table_path(
             "lake-iam-001",

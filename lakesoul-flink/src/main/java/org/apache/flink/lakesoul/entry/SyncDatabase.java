@@ -29,6 +29,8 @@ import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.types.logical.*;
 import org.apache.flink.types.Row;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.*;
 import java.util.*;
@@ -57,7 +59,10 @@ public class SyncDatabase {
     static String lineageUrl = null;
     static Boolean isTableExist;
 
+    private static final Logger log = LoggerFactory.getLogger(SyncDatabase.class);
     public static void main(String[] args) throws Exception {
+
+
         StringBuilder connectorOptions = new StringBuilder();
         ParameterTool parameter = ParameterTool.fromArgs(args);
         sourceDatabase = parameter.get(SOURCE_DB_DB_NAME.key());
@@ -129,10 +134,13 @@ public class SyncDatabase {
                 xsyncToDoris(env, fenodes);
                 break;
             case "mongodb":
-                String uri = parameter.get(MONGO_DB_URI.key());
+                String uri = url;
                 int batchSize = parameter.getInt(BATCH_SIZE.key(), BATCH_SIZE.defaultValue());
                 int batchIntervalMs = parameter.getInt(BATCH_INTERVAL_MS.key(), BATCH_INTERVAL_MS.defaultValue());
                 xsyncToMongodb(env, uri, batchSize, batchIntervalMs);
+                break;
+            case "sqlserver":
+                xsyncToSqlServer(env);
                 break;
             default:
                 throw new RuntimeException("not supported the database: " + dbType);
@@ -158,6 +166,34 @@ public class SyncDatabase {
         createTableQuery.append(")");
         return createTableQuery.toString();
     }
+
+    public static String sqlServerCreateTableSql(String[] stringFieldTypes, String[] fieldNames, String targetTableName, String pk) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("IF NOT EXISTS (SELECT * FROM sys.tables WHERE name='")
+                .append(targetTableName)
+                .append("')\n");
+
+        sb.append("CREATE TABLE ").append(targetTableName).append(" (");
+
+        for (int i = 0; i < fieldNames.length; i++) {
+            if (stringFieldTypes[i].equals("TIMESTAMP")){
+                sb.append(fieldNames[i]).append(" ").append("datetime2");
+            } else {
+                sb.append(fieldNames[i]).append(" ").append(stringFieldTypes[i]);
+            }
+            if (i != fieldNames.length - 1 || pk != null) {
+                sb.append(", ");
+            }
+        }
+
+        if (pk != null && !pk.isEmpty()) {
+            sb.append("CONSTRAINT PK_").append(targetTableName)
+                    .append(" PRIMARY KEY(").append(pk).append(")");
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
 
     public static String[] getMysqlFieldsTypes(DataType[] fieldTypes, String[] fieldNames, String pk) {
         String[] stringFieldTypes = new String[fieldTypes.length];
@@ -298,7 +334,10 @@ public class SyncDatabase {
 
         String createTableSql = pgAndMsqlCreateTableSql(stringFieldsTypes, fieldNames, targetTableName, tablePk);
         Statement statement = conn.createStatement();
-        statement.executeUpdate(createTableSql.toString());
+        if (!isTableExist){
+            statement.executeUpdate(createTableSql);
+            log.info("create the postgres table with the sql: "+createTableSql);
+        }
         StringBuilder coulmns = new StringBuilder();
         for (int i = 0; i < fieldDataTypes.length; i++) {
             switch (stringFieldsTypes[i]) {
@@ -381,7 +420,10 @@ public class SyncDatabase {
             }
         }
         // Create the target table in MySQL
-        statement.executeUpdate(createTableSql.toString());
+        if (!isTableExist){
+            statement.executeUpdate(createTableSql);
+            log.info("create the mysql table with the sql: "+createTableSql);
+        }
         StringBuilder coulmns = new StringBuilder();
         for (int i = 0; i < fieldDataTypes.length; i++) {
             if (stringFieldsTypes[i].equals("BLOB")) {
@@ -498,7 +540,9 @@ public class SyncDatabase {
                                       String uri,
                                       int batchSize,
                                       int batchInservalMs) throws Exception {
-        createMongoColl(targetDatabase, targetTableName, uri);
+
+        MongoSinkUtils mongoSinkUtils = new MongoSinkUtils();
+        mongoSinkUtils.createMongoColl(targetDatabase, targetTableName, uri);
         if (useBatch) {
             env.setRuntimeMode(RuntimeExecutionMode.BATCH);
         } else {
@@ -509,10 +553,11 @@ public class SyncDatabase {
         StreamTableEnvironment tEnvs = StreamTableEnvironment.create(env);
         Catalog lakesoulCatalog = new LakeSoulCatalog();
         tEnvs.registerCatalog("lakeSoul", lakesoulCatalog);
-        coll = tEnvs.sqlQuery("select * from lakeSoul.`" + sourceDatabase + "`.`" + sourceTableName + "`");
+        Table coll = tEnvs.sqlQuery("select * from lakeSoul.`" + sourceDatabase + "`.`" + sourceTableName + "`");
         tEnvs.registerTable("mongodbTbl", coll);
         Table table = tEnvs.sqlQuery("select * from mongodbTbl");
         DataStream<Tuple2<Boolean, Row>> rowDataStream = tEnvs.toRetractStream(table, Row.class);
+        MyMongoSerializationSchema mongoSerializationSchema = new MyMongoSerializationSchema(coll);
         MongoSink<Tuple2<Boolean, Row>> sink = MongoSink.<Tuple2<Boolean, Row>>builder()
                 .setUri(uri)
                 .setDatabase(targetDatabase)
@@ -521,9 +566,75 @@ public class SyncDatabase {
                 .setBatchIntervalMs(batchInservalMs)
                 .setMaxRetries(3)
                 .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
-                .setSerializationSchema(new MyMongoSerializationSchema())
+                .setSerializationSchema(mongoSerializationSchema)
                 .build();
         rowDataStream.sinkTo(sink).setParallelism(sinkParallelism);
         env.execute();
+    }
+
+    public static void xsyncToSqlServer(StreamExecutionEnvironment env) throws Exception {
+        if (useBatch) {
+            env.setRuntimeMode(RuntimeExecutionMode.BATCH);
+        } else {
+            env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
+            env.enableCheckpointing(checkpointInterval, CheckpointingMode.EXACTLY_ONCE);
+            env.getCheckpointConfig().setExternalizedCheckpointCleanup(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+        }
+        StreamTableEnvironment tEnvs = StreamTableEnvironment.create(env);
+        Catalog lakesoulCatalog = new LakeSoulCatalog();
+        tEnvs.registerCatalog("lakeSoul", lakesoulCatalog);
+        String jdbcUrl = url + ";databaseName=" + targetDatabase;
+        Table lakesoulTable = tEnvs.from("`lakeSoul`.`" + sourceDatabase + "`.`" + sourceTableName + "`");
+        DataType[] fieldDataTypes = lakesoulTable.getSchema().getFieldDataTypes();
+        String[] fieldNames = lakesoulTable.getSchema().getFieldNames();
+        String tablePk = getTablePk(sourceDatabase, sourceTableName);
+        String[] stringFieldsTypes = getMysqlFieldsTypes(fieldDataTypes, fieldNames, tablePk);
+        String createTableSql = sqlServerCreateTableSql(stringFieldsTypes, fieldNames, targetTableName, tablePk);
+        Connection conn = DriverManager.getConnection(jdbcUrl, username, password);
+        Statement statement = conn.createStatement();
+        if (!isTableExist){
+            statement.executeUpdate(createTableSql);
+            log.info("create the sqlserver table with the sql: "+createTableSql);
+        }
+        StringBuilder coulmns = new StringBuilder();
+        for (int i = 0; i < fieldDataTypes.length; i++) {
+            if (stringFieldsTypes[i].equals("BLOB")) {
+                coulmns.append("`").append(fieldNames[i]).append("` ").append("BYTES");
+            } else if (stringFieldsTypes[i].equals("TEXT")) {
+                coulmns.append("`").append(fieldNames[i]).append("` ").append("VARCHAR");
+            } else {
+                coulmns.append("`").append(fieldNames[i]).append("` ").append(stringFieldsTypes[i]);
+            }
+            if (i < fieldDataTypes.length - 1) {
+                coulmns.append(",");
+            }
+        }
+        String sql;
+        if (jdbcOrDorisOptions==null){
+            if (tablePk != null) {
+                sql = String.format(
+                        "create table %s(%s ,PRIMARY KEY (%s) NOT ENFORCED) with ('connector' = '%s', 'url' = '%s', 'table-name' = '%s', 'username' = '%s', 'password' = '%s', 'sink.parallelism' = '%s')",
+                        targetTableName, coulmns, tablePk, "jdbc", jdbcUrl, targetTableName, username, password, sinkParallelism);
+            } else {
+                sql = String.format("create table %s(%s) with ('connector' = '%s', 'url' = '%s', 'table-name' = '%s', 'username' = '%s', 'password' = '%s', 'sink.parallelism' = '%s')",
+                        targetTableName, coulmns, "jdbc", jdbcUrl, targetTableName, username, password, sinkParallelism);
+            }
+        }else {
+            if (tablePk != null) {
+                sql = String.format(
+                        "create table %s(%s ,PRIMARY KEY (%s) NOT ENFORCED) with ('connector' = '%s', 'url' = '%s', 'table-name' = '%s', 'username' = '%s', 'password' = '%s', 'sink.parallelism' = '%s', %s)",
+                        targetTableName, coulmns, tablePk, "jdbc", jdbcUrl, targetTableName, username, password, sinkParallelism, jdbcOrDorisOptions);
+            } else {
+                sql = String.format("create table %s(%s) with ('connector' = '%s', 'url' = '%s', 'table-name' = '%s', 'username' = '%s', 'password' = '%s', 'sink.parallelism' = '%s', %s)",
+                        targetTableName, coulmns, "jdbc", jdbcUrl, targetTableName, username, password, sinkParallelism, jdbcOrDorisOptions);
+            }
+        }
+
+        tEnvs.executeSql(sql);
+        System.out.println(sql);
+        tEnvs.executeSql("insert into " + targetTableName + " select * from lakeSoul.`" + sourceDatabase + "`." + sourceTableName);
+
+        statement.close();
+        conn.close();
     }
 }

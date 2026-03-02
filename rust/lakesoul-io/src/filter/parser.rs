@@ -5,8 +5,7 @@
 use std::ops::Not;
 use std::sync::Arc;
 
-use anyhow::anyhow;
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Fields, SchemaRef};
 use datafusion::functions::core::expr_ext::FieldAccessor;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::{SessionContext, col};
@@ -33,11 +32,13 @@ use datafusion_substrait::substrait::proto::{
 #[allow(deprecated)]
 use datafusion_substrait::variation_const::TIMESTAMP_MICRO_TYPE_VARIATION_REF;
 use prost::Message;
+use rootcause::compat::boxed_error::IntoBoxedError;
+use rootcause::report;
 use tokio::runtime::{Builder, Handle};
 use tokio::task;
 
 /// The parser for parsing the filter string from Java or Subtrait Plan.
-pub struct Parser {}
+pub struct Parser;
 
 pub enum FilterContainer {
     RawBuf(Vec<u8>),
@@ -48,6 +49,7 @@ pub enum FilterContainer {
 
 impl Parser {
     pub fn parse(filter_str: String, schema: SchemaRef) -> Result<Expr> {
+        debug!(filter_str=%filter_str);
         let (op, left, right) = Parser::parse_filter_str(filter_str)?;
         let expr = if op.eq("or") {
             let left_expr = Parser::parse(left, schema.clone())?;
@@ -67,7 +69,7 @@ impl Parser {
                     match op.as_str() {
                         "eq" => expr.is_null(),
                         "noteq" => expr.is_not_null(),
-                        _ => Expr::Literal(ScalarValue::Boolean(Some(true))),
+                        _ => Expr::Literal(ScalarValue::Boolean(Some(true)), None),
                     }
                 } else {
                     let value = Parser::parse_literal(field, right)?;
@@ -78,11 +80,11 @@ impl Parser {
                         "gteq" => expr.gt_eq(value),
                         "lt" => expr.lt(value),
                         "lteq" => expr.lt_eq(value),
-                        _ => Expr::Literal(ScalarValue::Boolean(Some(true))),
+                        _ => Expr::Literal(ScalarValue::Boolean(Some(true)), None),
                     }
                 }
             } else {
-                Expr::Literal(ScalarValue::Boolean(Some(false)))
+                Expr::Literal(ScalarValue::Boolean(Some(false)), None)
             }
         };
         Ok(expr)
@@ -91,10 +93,10 @@ impl Parser {
     fn parse_filter_str(filter: String) -> Result<(String, String, String)> {
         let op_offset = filter
             .find('(')
-            .ok_or(External(anyhow!("wrong filter str").into()))?;
+            .ok_or(External(report!("wrong filter str").into_boxed_error()))?;
         let (op, filter) = filter.split_at(op_offset);
         if !filter.ends_with(')') {
-            return Err(External(anyhow!("wrong filter str").into()));
+            return Err(External(report!("wrong filter str").into_boxed_error()));
         }
         let filter = &filter[1..filter.len() - 1];
         let mut k: usize = 0;
@@ -138,63 +140,100 @@ impl Parser {
         let expr = match data_type {
             DataType::Decimal128(precision, scale) => {
                 if precision <= 18 {
-                    Expr::Literal(ScalarValue::Decimal128(
-                        Some(value.parse::<i128>().map_err(|e| External(Box::new(e)))?),
-                        precision,
-                        scale,
-                    ))
+                    Expr::Literal(
+                        ScalarValue::Decimal128(
+                            Some(
+                                value
+                                    .parse::<i128>()
+                                    .map_err(|e| External(Box::new(e)))?,
+                            ),
+                            precision,
+                            scale,
+                        ),
+                        None,
+                    )
                 } else {
-                    let binary_vec = Parser::parse_binary_array(value.as_str())?
-                        .ok_or(External(anyhow!("parse binary array failed").into()))?;
+                    let binary_vec = Parser::parse_binary_array(value.as_str())?.ok_or(
+                        External(report!("parse binary array failed").into_boxed_error()),
+                    )?;
                     let mut arr = [0u8; 16];
                     for idx in 0..binary_vec.len() {
                         arr[idx + 16 - binary_vec.len()] = binary_vec[idx];
                     }
-                    Expr::Literal(ScalarValue::Decimal128(
-                        Some(i128::from_be_bytes(arr)),
-                        precision,
-                        scale,
-                    ))
+                    Expr::Literal(
+                        ScalarValue::Decimal128(
+                            Some(i128::from_be_bytes(arr)),
+                            precision,
+                            scale,
+                        ),
+                        None,
+                    )
                 }
             }
-            DataType::Boolean => Expr::Literal(ScalarValue::Boolean(Some(
-                value.parse::<bool>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Binary => Expr::Literal(ScalarValue::Binary(
-                Parser::parse_binary_array(value.as_str())?,
-            )),
-            DataType::Float32 => Expr::Literal(ScalarValue::Float32(Some(
-                value.parse::<f32>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Float64 => Expr::Literal(ScalarValue::Float64(Some(
-                value.parse::<f64>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Int8 => Expr::Literal(ScalarValue::Int8(Some(
-                value.parse::<i8>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Int16 => Expr::Literal(ScalarValue::Int16(Some(
-                value.parse::<i16>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Int32 => Expr::Literal(ScalarValue::Int32(Some(
-                value.parse::<i32>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Int64 => Expr::Literal(ScalarValue::Int64(Some(
-                value.parse::<i64>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Date32 => Expr::Literal(ScalarValue::Date32(Some(
-                value.parse::<i32>().map_err(|e| External(Box::new(e)))?,
-            ))),
-            DataType::Timestamp(_, _) => {
-                Expr::Literal(ScalarValue::TimestampMicrosecond(
+            DataType::Boolean => Expr::Literal(
+                ScalarValue::Boolean(Some(
+                    value.parse::<bool>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Binary => Expr::Literal(
+                ScalarValue::Binary(Parser::parse_binary_array(value.as_str())?),
+                None,
+            ),
+            DataType::Float32 => Expr::Literal(
+                ScalarValue::Float32(Some(
+                    value.parse::<f32>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Float64 => Expr::Literal(
+                ScalarValue::Float64(Some(
+                    value.parse::<f64>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Int8 => Expr::Literal(
+                ScalarValue::Int8(Some(
+                    value.parse::<i8>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Int16 => Expr::Literal(
+                ScalarValue::Int16(Some(
+                    value.parse::<i16>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Int32 => Expr::Literal(
+                ScalarValue::Int32(Some(
+                    value.parse::<i32>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Int64 => Expr::Literal(
+                ScalarValue::Int64(Some(
+                    value.parse::<i64>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Date32 => Expr::Literal(
+                ScalarValue::Date32(Some(
+                    value.parse::<i32>().map_err(|e| External(Box::new(e)))?,
+                )),
+                None,
+            ),
+            DataType::Timestamp(_, _) => Expr::Literal(
+                ScalarValue::TimestampMicrosecond(
                     Some(value.parse::<i64>().map_err(|e| External(Box::new(e)))?),
                     Some(crate::constant::LAKESOUL_TIMEZONE.into()),
-                ))
-            }
+                ),
+                None,
+            ),
             DataType::Utf8 => {
                 let value = value.as_str()[8..value.len() - 2].to_string();
-                Expr::Literal(ScalarValue::Utf8(Some(value)))
+                Expr::Literal(ScalarValue::Utf8(Some(value)), None)
             }
-            _ => Expr::Literal(ScalarValue::Utf8(Some(value))),
+            _ => Expr::Literal(ScalarValue::Utf8(Some(value)), None),
         };
         Ok(expr)
     }
@@ -338,7 +377,7 @@ impl Parser {
                     .await;
             }
             FilterContainer::String(s) => {
-                let arrow_schema = Arc::new(Schema::from(schema));
+                let arrow_schema = Arc::new(schema.as_arrow().clone());
                 Ok(vec![Parser::parse(s, arrow_schema)?])
             }
             FilterContainer::Plan(plan) => {

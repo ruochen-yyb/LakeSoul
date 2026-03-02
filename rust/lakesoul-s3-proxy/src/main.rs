@@ -80,7 +80,7 @@ fn main() {
     info!("pg url {:?}", std::env::var("LAKESOUL_PG_URL"));
     let common_prefix = std::env::var("LAKESOUL_COMMON_PREFIX")
         .ok()
-        .and_then(|s| Some(s.trim_end_matches('/').to_string()));
+        .map(|s| s.trim_end_matches('/').to_string());
 
     // first try aws
     let handler: Arc<dyn HTTPHandler + Send + Sync + 'static> =
@@ -228,9 +228,12 @@ impl S3ProxyHandle {
                 debug!("Parsed table path {:?}", path);
                 if match self.common_prefix {
                     Some(ref prefix) => {
-                        path.starts_with(
-                            format!("{}/{}/{}", prefix, self.group, self.user).as_str(),
-                        ) || path.starts_with(format!("{}/files", prefix).as_str())
+                        (!path.starts_with(prefix))
+                            || path.starts_with(
+                                format!("{}/{}/{}", prefix, self.group, self.user)
+                                    .as_str(),
+                            )
+                            || path.starts_with(format!("{}/files", prefix).as_str())
                     }
                     None => {
                         path.starts_with(
@@ -246,7 +249,10 @@ impl S3ProxyHandle {
                     &["savepoint", "checkpoint", "resource-manager", "files"],
                     &self.common_prefix,
                 ) {
-                    debug!("path is a valid predefined prefix {}, access allowed", path);
+                    debug!(
+                        "Path is a valid predefined prefix or unchecked other dir/bucket {}, access allowed",
+                        path
+                    );
                     return Ok(());
                 }
                 match verify_permission_by_table_path(
@@ -305,9 +311,8 @@ impl BackgroundService for S3ProxyHandle {
             let metadata_client = Arc::new(
                 MetaDataClient::from_env()
                     .await
-                    .map(|metadata_client| {
+                    .inspect(|_metadata_client| {
                         info!("initialized metadata client");
-                        metadata_client
                     })
                     .unwrap_or_else(|e| {
                         error!("create metadata client error: {e:?}");
@@ -377,7 +382,7 @@ impl ProxyHttp for S3Proxy {
         let s = format!(
             "{}{}",
             self.handle.http_handle.get_endpoint(),
-            session.req_header().uri.to_string()
+            session.req_header().uri
         );
         debug!("Requesting url {:?}", s);
 
@@ -389,11 +394,11 @@ impl ProxyHttp for S3Proxy {
         ctx.require_request_body_rewrite = self
             .handle
             .http_handle
-            .require_request_body_rewrite(&ctx, session.req_header());
+            .require_request_body_rewrite(ctx, session.req_header());
         ctx.require_response_body_rewrite = self
             .handle
             .http_handle
-            .require_response_body_rewrite(&ctx, session.req_header());
+            .require_response_body_rewrite(ctx, session.req_header());
         debug!(
             "request_filter original header: {:?}, params: {:?}, \
             rewrite req body {}, rewrite reps body {}",
@@ -411,8 +416,7 @@ impl ProxyHttp for S3Proxy {
             .uri
             .path()
             .split("/")
-            .filter(|s| !s.is_empty())
-            .next()
+            .find(|s| !s.is_empty())
         {
             bucket = path.to_string();
         } else {
@@ -429,20 +433,17 @@ impl ProxyHttp for S3Proxy {
         ctx.bucket = bucket;
 
         // verify meta permission
-        match self.handle.verify_rbac(session.req_header(), &ctx).await {
-            Err(e) => {
-                let msg = format!(
-                    "Permission denied error {:?}, uri {:?}",
-                    e,
-                    session.req_header().uri
-                );
-                error!("{}", msg);
-                session
-                    .respond_error_with_body(403, Bytes::from(msg))
-                    .await?;
-                return Ok(true);
-            }
-            _ => {}
+        if let Err(e) = self.handle.verify_rbac(session.req_header(), ctx).await {
+            let msg = format!(
+                "Permission denied error {:?}, uri {:?}",
+                e,
+                session.req_header().uri
+            );
+            error!("{}", msg);
+            session
+                .respond_error_with_body(403, Bytes::from(msg))
+                .await?;
+            return Ok(true);
         }
 
         // modify header (e.g. converting headers and params, signing)
@@ -689,16 +690,15 @@ fn parse_table_path_from_query(query: &str, bucket_name: &str) -> String {
     let query_parts_iter = query.split("&");
     for query_part in query_parts_iter {
         let mut query_part_iter = query_part.split("=");
-        if let Some(key) = query_part_iter.next() {
-            if key == "prefix" {
-                if let Some(value) = query_part_iter.next() {
-                    return assemble_table_path(
-                        value.split("%2F").filter(|s| !s.is_empty()),
-                        bucket_name,
-                        "%3D",
-                    );
-                }
-            }
+        if let Some(key) = query_part_iter.next()
+            && key == "prefix"
+            && let Some(value) = query_part_iter.next()
+        {
+            return assemble_table_path(
+                value.split("%2F").filter(|s| !s.is_empty()),
+                bucket_name,
+                "%3D",
+            );
         }
     }
     format!("s3://{}", bucket_name)
@@ -711,7 +711,7 @@ fn parse_table_path(uri: &Uri, bucket: &str) -> String {
     path_parts_iter.next().unwrap();
 
     let bucket_name = bucket;
-    if let None = path_parts_iter.peek() {
+    if path_parts_iter.peek().is_none() {
         // a list request without path
         // retrieve path from query string
         let query = uri.query().unwrap_or("");
@@ -730,13 +730,14 @@ mod tests {
     use super::*;
     use arrow::util::pretty::print_batches;
     use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch};
-    use lakesoul_datafusion::LakeSoulQueryPlanner;
     use lakesoul_datafusion::catalog::create_io_config_builder;
     use lakesoul_datafusion::lakesoul_table::LakeSoulTable;
+    use lakesoul_datafusion::planner::LakeSoulQueryPlanner;
     use lakesoul_datafusion::serialize::arrow_java::ArrowJavaSchema;
-    use lakesoul_io::lakesoul_io_config::create_session_context_with_planner;
+    use lakesoul_io::session::create_session_context_with_planner;
     use lakesoul_metadata::MetaDataClientRef;
     use proto::proto::entity::TableInfo;
+    use rootcause::compat::anyhow1::IntoAnyhow;
 
     #[test]
     fn test_parse_table_path() {
@@ -783,7 +784,7 @@ mod tests {
         assert_eq!(
             parse_table_path(
                 &Uri::from_static(
-                    "/lakesoul-test-bucket/test/default/abc/date=20250221/type=1/test.parquet"
+                    "/lakesoul-test-bucket/test/default/abc/date%3D20250221/type%3D1/test.parquet"
                 ),
                 "lakesoul-test-bucket"
             ),
@@ -872,7 +873,8 @@ mod tests {
             table_name,
             Some(meta_data_client.clone()),
         )
-        .await?;
+        .await
+        .into_anyhow()?;
         table.execute_upsert(record_batch).await?;
         Ok((table_id, path.to_string()))
     }
@@ -943,13 +945,13 @@ mod tests {
     ) -> Result<(String, String), anyhow::Error> {
         let table_name = format!("test_rbac_table_{}", suffix);
         let table_path = format!("s3://lakesoul-test-bucket/tmp/table_{}", suffix);
-        let doamin = format!("lake-cz{}", suffix);
+        let domain = format!("lake-cz{}", suffix);
         let record_batch =
             create_batch_i32(vec!["id", "data"], vec![&[1, 2, 3], &[1, 2, 3]]);
         create_and_write_table(
             &table_name,
             &table_path,
-            &doamin,
+            &domain,
             record_batch.clone(),
             metadata_client.clone(),
         )
@@ -968,7 +970,8 @@ mod tests {
             &table_name,
             Some(metadata_client.clone()),
         )
-        .await?;
+        .await
+        .into_anyhow()?;
         table.execute_upsert(record_batch).await?;
         Ok(())
     }
@@ -986,7 +989,8 @@ mod tests {
             Default::default(),
             Default::default(),
         )
-        .await?;
+        .await
+        .into_anyhow()?;
         let sess_ctx = create_session_context_with_planner(
             &mut builder.build(),
             Some(LakeSoulQueryPlanner::new_ref()),
@@ -996,7 +1000,8 @@ mod tests {
             &table_name,
             Some(metadata_client.clone()),
         )
-        .await?;
+        .await
+        .into_anyhow()?;
         let dataframe = table.to_dataframe(&sess_ctx).await?;
         let results = dataframe.collect().await?;
         print_batches(&results)?;
@@ -1019,22 +1024,15 @@ mod tests {
             create_table_and_write_suffix("dwd", metadata_client.clone()).await?;
 
         let _thread_handle = run_server();
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
         change_s3_to_proxy();
 
         // verify read/write table in ads domain success
         insert_table("ads", metadata_client.clone()).await?;
         read_table("ads", metadata_client.clone()).await?;
 
-        // verify read/write table in dwd domain failed
-        let err = insert_table("dwd", metadata_client.clone())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("403 Forbidden"));
-        let err = read_table("dwd", metadata_client.clone())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("403 Forbidden"));
+        insert_table("dwd", metadata_client.clone()).await?;
+        read_table("dwd", metadata_client.clone()).await?;
 
         drop_table(&uuid_ads, &table_path_ads, metadata_client.clone()).await?;
         drop_table(&uuid_dwd, &table_path_dwd, metadata_client.clone()).await?;

@@ -2,11 +2,13 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+.zed
 .pytest_cache
 /target/
 /build/
 /.idea/
 /spark-warehouse/
+/lakesoul-spark-gluten/target/
 /derby.log
 /.metals/
 /.vscode/
@@ -43,3 +45,17 @@ __pycache__/
 **/.venv/
 .flattened-pom.xml
 /**/*.so
+**/.project
+**/.factorypath
+**/.classpath
+**/.settings
+native-io/lakesoul-io-java/bin
+lakesoul-spark/bin
+lakesoul-flink/bin
+lakesoul-common/bin
+lakesoul-presto/bin
+lakesoul-spark-gluten/bin
+**/.envrc
+
+**/memory_profiling.png
+**/output.log

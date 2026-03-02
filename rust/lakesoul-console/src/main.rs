@@ -4,15 +4,20 @@
 
 use std::{path::Path, process::ExitCode, sync::Arc};
 
-use crate::exec::{exec_command, exec_from_files, exec_from_repl};
-use crate::print::Printer;
 use clap::{Parser, Subcommand};
 use lakesoul_datafusion::{
     MetaDataClient, cli::CoreArgs, create_lakesoul_session_ctx, tpch::register_tpch_udtfs,
 };
 use rand::Rng;
 use rand::distr::Alphanumeric;
+use rootcause::Report;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
+
+use crate::exec::{exec_command, exec_from_files, exec_from_repl};
+use crate::print::Printer;
+
+type Result<T, E = Report> = std::result::Result<T, E>;
 
 mod exec;
 mod logo;
@@ -78,33 +83,37 @@ fn rand_str() -> String {
     s
 }
 
-fn init_log(mut log_dir: &str) {
+fn init_log(mut log_dir: &str) -> WorkerGuard {
     if log_dir.ends_with("/") {
         log_dir = &log_dir[..log_dir.len() - 1];
     }
 
     let log_dir = format!("{log_dir}/lakesoul_log_{}", rand_str());
-    tracing::debug!("log_dir:{}", &log_dir);
     let file_appender = tracing_appender::rolling::never(&log_dir, "console.log");
     let timer = tracing_subscriber::fmt::time::ChronoLocal::rfc_3339();
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     let level = EnvFilter::from_default_env();
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_env_filter(level)
         .with_ansi(false)
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(false)
         .with_thread_ids(true)
         .with_timer(timer)
         .init();
+    tracing::debug!("log_dir:{}", &log_dir);
+    guard
 }
 
 fn print_banner() {
     println!("{}", logo::LOGO);
 }
 
-async fn main_inner(cli: Cli) -> anyhow::Result<()> {
+async fn main_inner(cli: Cli) -> Result<()> {
     print_banner();
-    init_log(&cli.log_dir);
+    let _log_guard = init_log(&cli.log_dir);
     let meta_client = Arc::new(MetaDataClient::from_env().await?);
 
     let ctx = create_lakesoul_session_ctx(meta_client, &cli.core).unwrap();
