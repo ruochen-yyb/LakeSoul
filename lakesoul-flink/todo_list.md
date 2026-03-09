@@ -11,3 +11,4 @@
 - [x] 调整 SQL 组装：模板仅提供字段映射主体，不再要求模板显式提供 `WHERE` 与 `{{partition_desc}}`。
 - [x] 实现分区条件自动拼装：将 `partition_desc` 按逗号与首个等号拆分，保持顺序拼接为 `AND` 条件。
 - [x] 更新 README：补充分区/非分区任务的自动 `WHERE` 规则与 `partition_desc` 示例。
+- [x] 增强排障日志：每次任务执行前打印完整 SQL（含 isPartitionTable、partitionDesc）便于核对 `WHERE` 是否生效。

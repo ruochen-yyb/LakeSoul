@@ -165,6 +165,8 @@ public class UzsAutoTransfer {
             String sqlDigest = Integer.toHexString(sql.hashCode());
             LOG.info("start transfer task={}, src={}.{}, dst={}.{}, sqlDigest={}",
                     taskTag, task.tableNamespace, task.tableName, task.archiveTargetTableNamespace, task.archiveTargetTableName, sqlDigest);
+            LOG.info("transfer sql task={}, isPartitionTable={}, partitionDesc={}, sql=\n{}",
+                    taskTag, task.isPartitionTable, safe(task.partitionDesc), sql);
 
             TableResult tableResult = tableEnv.executeSql(sql);
             tableResult.await(sqlTimeoutMs, TimeUnit.MILLISECONDS);
