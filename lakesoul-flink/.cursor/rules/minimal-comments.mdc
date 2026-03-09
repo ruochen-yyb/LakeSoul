@@ -1,0 +1,79 @@
+---
+alwaysApply: true
+---
+
+你是一位lakesoul、spark的专家。
+
+暂定该任务名称为：uzs-lakesoul-flink-auto-transfer
+
+我正在使用lakesoul作为湖仓，现在要实现一个lakesoul湖仓自动转储工具，只需要根据接口返回的信息，组装sql然后执行就可以了，
+
+每轮对话需要与我进行确认，并且将步骤更新到当前目录的todo_list.md中，然后按步骤进行。
+
+写代码前需要得到我的确认，在根据步骤进行落地
+
+当使用方式更新，多了新的参数时，要将使用方式更新到当前目录 README.md文件中
+
+不需要进行任何形式的编译测试，我会自己进行，报错我会联系你
+
+接口文档在docs/api_docs.md
+
+新的类写到：src/main/java/org/apache/flink/lakesoul/entry/transfer中，叫做UzsAutoTransfer
+
+转储任务通过批处理进行
+
+功能需求：
+    走串行单任务轮询
+    走getTransferTask接口拿到要进行的转储任务，自行组装sql，然后执行。
+    任务出错的话调用setTaskErr接口，提交错误信息，以便下一次重试
+    在任务成功完成，调用setTaskDone接口后离开请求下一个任务
+    如果任务出错，调用setTaskErr接口后，等待5分钟在请求下一次任务信息
+    根据领取任务的isPartitionTable字段确定是否传入分区参数进行转储，如果是false，进行全表转储
+
+archive_sqltmp 模板与安全要求
+    仅允许白名单占位符（源命名空间、源表、目标命名空间、目标表、分区值），禁止任意自由拼接；
+    使用“模板解析器 + 占位符校验 + 禁止多语句/注释/DDL”的硬约束。
+    模板只允许单条 DML：INSERT INTO ... SELECT ... FROM ... WHERE ...
+    严格禁止：多语句、注释、DDL、危险关键字、未知占位符，固定（DROP/ALTER/TRUNCATE/CREATE/; / -- / /* */ 等）
+    渲染时对标识符和分区值做类型化处理，不直接字符串拼接
+    占位符规范：
+        {{src_ns}}：源命名空间（标识符）
+        {{src_table}}：源表名（标识符）
+        {{dst_ns}}：目标命名空间（标识符）
+        {{dst_table}}：目标表名（标识符）
+        {{partition_desc}}：分区值（字符串字面量，不是 SQL 片段）
+    示例：
+        INSERT INTO {{dst_ns}}.{{dst_table}}
+        SELECT *
+        FROM {{src_ns}}.{{src_table}}
+        WHERE partition_desc = '{{partition_desc}}'
+        INSERT INTO archive_target_table_namespace.archive_target_table_name
+        (
+            SELECT
+                *
+            FROM table_namespace.table_name
+            where condition='2026-02-18-19'
+        );
+
+缺陷补充：
+    回调一致性
+        SQL执行成功但 setTaskDone 失败：仅重试回调，不重复执行SQL。
+        回调重试策略：3~5 次短退避（如 2s/5s/10s/30s），超限后落告警状态。
+    错误分级与退避
+        可重试：网络超时、临时连接失败、接口 5xx -> 指数退避（上限5分钟）。
+        不可重试：参数缺失、模板渲染失败、语义校验失败 -> 直接 setTaskErr 并拉取下一任务。
+    任务超时/卡死保护
+        单任务最大执行时长（如30分钟，可配置）；超时主动中断并上报 ERR_TIMEOUT。
+        连续失败阈值（如10次）触发熔断等待窗口，避免刷爆接口。
+    分区语义边界
+        isPartitionTable=false 时禁止传分区值；true 时必须有合法分区值。
+        分区值空串/NULL 的处理规则前置定义，避免“全表误转储”。
+    可观测性最小集
+        日志字段固定：taskId/attemptId/src/dst/sqlDigest/errCode。
+        指标最小集：领取数、成功数、失败数、平均耗时、连续失败次数、回调失败次数。
+    配置与协议健壮性
+        启动即校验接口地址、鉴权、轮询间隔、超时参数；非法配置直接 fail-fast。
+        对未知任务字段保持向前兼容（忽略+告警），防止接口演进导致任务中断。
+
+使用方式：
+    flink run的方式提交一个长驻的flink任务
