@@ -387,7 +387,6 @@ public class UzsAutoTransfer {
                 + "'s3a.secret-key' = '" + escapeSqlLiteral(s3SecretKey) + "',"
                 + "'s3a.path.style.access' = '" + escapeSqlLiteral(s3PathStyleAccess) + "'"
                 + ")";
-        tableEnv.executeSql("SET execution.runtime-mode = batch");
         tableEnv.executeSql(createCatalogSql);
         tableEnv.executeSql("USE CATALOG " + escapedCatalog);
         LOG.info("init lakesoul catalog done, catalog={}, warehouse={}", catalogName, warehouse);

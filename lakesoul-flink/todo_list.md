@@ -7,3 +7,4 @@
 - [x] 实现回写策略：成功 `setTaskDone`，失败 `setTaskErr`，并对 `setTaskDone` 失败做短退避重试。
 - [x] 更新使用方式文档：新增运行参数和 `flink run` 示例。
 - [x] 增加 Batch 执行与 LakeSoul Catalog 初始化（CREATE/USE CATALOG）。
+- [x] 修复启动兼容性：移除 `executeSql("SET execution.runtime-mode = batch")`，避免 Flink 版本不支持 `SET` 导致启动失败。
