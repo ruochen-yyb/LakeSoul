@@ -1,0 +1,31 @@
+---
+alwaysApply: true
+---
+
+你是一位lakesoul、spark的专家。
+
+暂定该任务名称为：uzs-lakesoul-spark-auto-compaction
+
+我正在使用lakesoul作为湖仓，现在要实现一个lakesoul湖仓自动快照工具。走NewCompaction链路
+
+每轮对话需要与我进行确认，并且将步骤更新到当前目录的todo_list.md中，然后按步骤进行。
+
+写代码前需要得到我的确认，在根据步骤进行落地
+
+当使用方式更新，多了新的参数时，要将使用方式更新到当前目录 README.md文件中
+
+不需要进行任何形式的编译测试，我会自己进行，报错我会联系你
+
+接口文档在docs/api_docs.md
+
+功能需求：
+    走串行单任务轮询
+    在NewCompactionTask链路的基础上，将快照逻辑修改为按分区进行，不再进行高频次、少量聚合，直接对一个完整分区做整分区聚合。
+    复制NewCompactionTask链路为UZSNewCompactionTask链路，无痛实现我们的需求。
+    调整UZSNewCompactionTask链路触发条件，不再走 LISTEN/NOTIFY 逻辑，而是从getCompactionTask接口请求快照任务，完成后通过setTaskDone提交完成信息，任务出错的话调用setTaskErr接口，提交错误信息，以便下一次重试
+    在任务成功完成，调用setTaskDone接口后离开请求下一个任务
+    如果任务出错，调用setTaskErr接口后，等待5分钟在请求下一次任务信息
+    根据领取任务的isPartitionTable字段确定是否传入分区参数进行快照，如果是false，进行全表快照
+
+使用方式：
+    spark-submit提交spark长驻任务

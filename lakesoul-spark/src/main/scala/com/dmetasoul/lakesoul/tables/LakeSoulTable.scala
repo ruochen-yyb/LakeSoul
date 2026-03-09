@@ -12,7 +12,7 @@ import com.dmetasoul.lakesoul.tables.execution.LakeSoulTableOperations
 import org.apache.hadoop.fs.Path
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
-import org.apache.spark.sql.arrow.{CompactBucketIO, CompressDataFileInfo}
+import org.apache.spark.sql.arrow.{CompactBucketIO, CompressDataFileInfo, UZSFullPartitionCompactBucketIO}
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator.MergeOperator
 import org.apache.spark.sql.functions.expr
@@ -514,6 +514,173 @@ class LakeSoulTable(df: => Dataset[Row], snapshotManagement: SnapshotManagement)
     if (newBucketNum.isDefined) {
       val properties = SparkMetaVersion.dbManager.getTableInfoByTableId(tableInfo.table_id).getProperties
       val newProperties = JSON.parseObject(properties);
+      newProperties.put(TableInfoProperty.HASH_BUCKET_NUM, newBucketNum.get.toString)
+      SparkMetaVersion.dbManager.updateTableProperties(tableInfo.table_id, newProperties.toJSONString)
+      snapshotManagement.updateSnapshot()
+    }
+  }
+
+  def uzsFullPartitionCompaction(conditionStr: String = "",
+                                 newBucketNum: Option[Int] = None): Unit = {
+    val tableInfo = snapshotManagement.getTableInfoOnly
+    val tablePath = tableInfo.table_path.toString
+    val tableHashBucketNum = if (newBucketNum.isDefined) newBucketNum.get else tableInfo.bucket_num
+    val condition = conditionStr match {
+      case "" => None
+      case _: String => Option(expr(conditionStr).expr)
+    }
+    val spark = SparkSession.active
+
+    def executeCompactOnePartition(part: PartitionInfoScala, uuid: UUID): Unit = {
+      val files = DataOperation.getSinglePartitionDataInfo(part)
+      if (files.nonEmpty) {
+        val bucketToFiles = if (tableInfo.hash_partition_columns.isEmpty) {
+          Seq(files)
+        } else {
+          files.groupBy(_.file_bucket_id).values.toSeq
+        }
+        sparkSession.sparkContext.setJobDescription(
+          s"UZSFullPartitionCompact(${tableInfo.namespace}.${tableInfo.short_table_name.getOrElse(tableInfo.table_path)}/$condition,b=$newBucketNum)")
+        val fileRDD = spark.sparkContext.parallelize(bucketToFiles, bucketToFiles.size)
+        val configuration = new SerializableWritable(spark.sessionState.newHadoopConf())
+        val partitionValues = part.range_value
+        val compactResult = fileRDD.map {
+          dataFileInfo => {
+            val taskId = TaskContext.get().partitionId()
+            val needDealFileInfo = dataFileInfo.map(file => {
+              new CompressDataFileInfo(file.path, file.size, file.file_exist_cols, file.modification_time)
+            }).toList.asJava
+            tryWithResource(new UZSFullPartitionCompactBucketIO(
+              configuration.value,
+              needDealFileInfo,
+              tableInfo,
+              tablePath,
+              partitionValues,
+              tableHashBucketNum,
+              tableInfo.bucket_num != tableHashBucketNum,
+              taskId
+            )) { compactBucketIO =>
+              val partitionDescAndFilesMap = compactBucketIO.startCompactTask().asScala
+              partitionDescAndFilesMap.flatMap(result => {
+                val (partitionDesc, flushResult) = result
+                val array = flushResult.asScala.map(
+                  f => DataFileInfo(partitionDesc, f.getFilePath, "add", f.getFileSize, f.getTimestamp, f.getFileExistCols))
+                array
+              }).toSeq
+            }
+          }
+        }
+        val dataFileInfoSeq = compactResult.flatMap(ff => ff).collect().toSeq
+        if (dataFileInfoSeq.nonEmpty) {
+          val discardFileInfo = dataFileInfoSeq
+            .filter(file => file.range_partitions.equals(UZSFullPartitionCompactBucketIO.DISCARD_FILE_LIST_KEY))
+          if (discardFileInfo.nonEmpty) {
+            println(f"[uzs-compaction-$uuid]: $partitionValues finished")
+          } else {
+            println(f"[uzs-compaction-$uuid]: $partitionValues error")
+          }
+          commitMetadata(dataFileInfoSeq, partitionValues, tableInfo, part)
+        } else {
+          println(s"[WARN] read file size is ${files.length}, but without file created after UZS full partition compaction")
+        }
+      }
+
+      def commitMetadata(dataFileInfo: Seq[DataFileInfo], rangePartition: String, tableInfo: TableInfo,
+                         readPartitionInfo: PartitionInfoScala): Unit = {
+        val add_file_arr_buf = List.newBuilder[DataCommitInfo]
+        val addUUID = UUID.randomUUID()
+        val timestampFormatter =
+          TimestampFormatter("yyy-MM-dd", java.util.TimeZone.getDefault)
+        val discardFileInfo = dataFileInfo
+          .filter(file => file.range_partitions.equals(UZSFullPartitionCompactBucketIO.DISCARD_FILE_LIST_KEY))
+        logInfo(s"UZS full partition compaction discarded files $discardFileInfo")
+        val discardCompressedFileList = discardFileInfo.map { file =>
+          DiscardCompressedFileInfo.newBuilder()
+            .setFilePath(file.path)
+            .setTablePath(tableInfo.table_path_s.get)
+            .setPartitionDesc(rangePartition)
+            .setTimestamp(file.modification_time)
+            .setTDate(timestampFormatter.format(file.modification_time))
+            .build()
+        }
+        val dataFileInfoAfterFilter = dataFileInfo
+          .filter(file => !file.range_partitions.equals(UZSFullPartitionCompactBucketIO.DISCARD_FILE_LIST_KEY))
+        val fileOps = dataFileInfoAfterFilter.map { file =>
+          DataFileOp.newBuilder()
+            .setPath(file.path)
+            .setFileOp(FileOp.add)
+            .setSize(file.size)
+            .setFileExistCols(file.file_exist_cols)
+            .build()
+        }
+        add_file_arr_buf += DataCommitInfo.newBuilder()
+          .setTableId(tableInfo.table_id)
+          .setPartitionDesc(rangePartition)
+          .setCommitId(
+            Uuid.newBuilder().setHigh(addUUID.getMostSignificantBits).setLow(addUUID.getLeastSignificantBits).build())
+          .addAllFileOps(fileOps.toList.asJava)
+          .setCommitOp(CommitOp.CompactionCommit)
+          .setTimestamp(System.currentTimeMillis())
+          .setCommitted(false)
+          .build()
+
+        val add_partition_info_arr_buf = List.newBuilder[PartitionInfoScala]
+        add_partition_info_arr_buf += PartitionInfoScala(
+          table_id = tableInfo.table_id,
+          range_value = rangePartition,
+          read_files = Array(addUUID)
+        )
+
+        val meta_info = MetaInfo(
+          table_info = tableInfo,
+          dataCommitInfo = add_file_arr_buf.result().toArray,
+          partitionInfoArray = add_partition_info_arr_buf.result().toArray,
+          commit_type = CommitType("compaction"),
+          query_id = "",
+          batch_id = -1,
+          readPartitionInfo = Array(readPartitionInfo)
+        )
+
+        MetaCommit.doMetaCommit(meta_info, changeSchema = false)
+        MetaCommit.recordDiscardFileInfo(discardCompressedFileList.toList.asJava)
+      }
+    }
+
+    val uuid = UUID.randomUUID()
+    println(f"[uzs-compaction-$uuid]: begin")
+    if (condition.isDefined) {
+      val partitionFilters = Seq(condition.get).flatMap { filter =>
+        LakeSoulUtils.splitMetadataAndDataPredicates(filter, tableInfo.range_partition_columns, spark)._1
+      }
+      if (partitionFilters.isEmpty) {
+        throw LakeSoulErrors.partitionColumnNotFoundException(condition.get, 0)
+      }
+      val partitionFilterInfo = PartitionFilter.partitionsForScan(snapshotManagement.snapshot, partitionFilters)
+      if (partitionFilterInfo.nonEmpty) {
+        if (partitionFilterInfo.length < 1) {
+          throw LakeSoulErrors.partitionColumnNotFoundException(condition.get, 0)
+        } else if (partitionFilterInfo.length > 1) {
+          throw LakeSoulErrors.partitionColumnNotFoundException(condition.get, partitionFilterInfo.size)
+        }
+        val partitionInfo = SparkMetaVersion.getSinglePartitionInfo(
+          tableInfo.table_id,
+          partitionFilterInfo.head.range_value,
+          ""
+        )
+        executeCompactOnePartition(partitionInfo, uuid)
+      }
+    } else {
+      val allInfo = SparkMetaVersion.getAllPartitionInfo(tableInfo.table_id)
+      val partitionsNeedCompact = allInfo.filter(_.read_files.length >= 1)
+      partitionsNeedCompact.foreach(part => {
+        executeCompactOnePartition(part, uuid)
+      })
+    }
+    println(f"[uzs-compaction-$uuid]: end")
+
+    if (newBucketNum.isDefined) {
+      val properties = SparkMetaVersion.dbManager.getTableInfoByTableId(tableInfo.table_id).getProperties
+      val newProperties = JSON.parseObject(properties)
       newProperties.put(TableInfoProperty.HASH_BUCKET_NUM, newBucketNum.get.toString)
       SparkMetaVersion.dbManager.updateTableProperties(tableInfo.table_id, newProperties.toJSONString)
       snapshotManagement.updateSnapshot()
