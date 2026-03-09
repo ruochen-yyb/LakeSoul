@@ -46,7 +46,7 @@ archive_sqltmp 模板与安全要求
         INSERT INTO {{dst_ns}}.{{dst_table}}
         SELECT *
         FROM {{src_ns}}.{{src_table}}
-        WHERE partition_desc = '{{partition_desc}}'
+        
         INSERT INTO archive_target_table_namespace.archive_target_table_name
         (
             SELECT

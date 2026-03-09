@@ -69,17 +69,16 @@ public class UzsAutoTransfer {
     private static final String PLACEHOLDER_SRC_TABLE = "src_table";
     private static final String PLACEHOLDER_DST_NS = "dst_ns";
     private static final String PLACEHOLDER_DST_TABLE = "dst_table";
-    private static final String PLACEHOLDER_PARTITION_DESC = "partition_desc";
     private static final Set<String> ALLOWED_PLACEHOLDERS = Set.of(
             PLACEHOLDER_SRC_NS,
             PLACEHOLDER_SRC_TABLE,
             PLACEHOLDER_DST_NS,
-            PLACEHOLDER_DST_TABLE,
-            PLACEHOLDER_PARTITION_DESC
+            PLACEHOLDER_DST_TABLE
     );
 
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\{\\{\\s*([a-zA-Z0-9_]+)\\s*}}");
     private static final Pattern IDENTIFIER_PATTERN = Pattern.compile("^[a-zA-Z0-9_]+$");
+    private static final Pattern WHERE_PATTERN = Pattern.compile("(?i)\\bwhere\\b");
     private static final Pattern FORBIDDEN_TOKEN_PATTERN = Pattern.compile("(;|--|/\\*|\\*/)");
     private static final Pattern FORBIDDEN_KEYWORD_PATTERN = Pattern.compile("(?i)\\b(drop|alter|truncate|create)\\b");
     private static final Pattern SINGLE_DML_PATTERN = Pattern.compile("(?is)^\\s*insert\\s+into\\b.+\\bselect\\b.+\\bfrom\\b.+");
@@ -218,12 +217,8 @@ public class UzsAutoTransfer {
         rendered = replacePlaceholder(rendered, PLACEHOLDER_DST_TABLE, escapeIdentifier(task.archiveTargetTableName));
 
         if (Boolean.TRUE.equals(task.isPartitionTable)) {
-            if (StringUtils.isBlank(task.partitionDesc)) {
-                throw new IllegalArgumentException("partition task requires partitionDesc");
-            }
-            rendered = replacePlaceholder(rendered, PLACEHOLDER_PARTITION_DESC, escapeStringLiteralValue(task.partitionDesc));
-        } else if (containsPlaceholder(rendered, PLACEHOLDER_PARTITION_DESC)) {
-            throw new IllegalArgumentException("non-partition task must not use {{partition_desc}}");
+            String partitionPredicate = buildPartitionPredicate(task.partitionDesc);
+            rendered = appendPredicate(rendered, partitionPredicate);
         }
 
         Matcher matcher = PLACEHOLDER_PATTERN.matcher(rendered);
@@ -244,6 +239,9 @@ public class UzsAutoTransfer {
         requireNotBlank(task.archiveTargetTableName, "archiveTargetTableName");
         requireNotBlank(task.archiveTargetTableNamespace, "archiveTargetTableNamespace");
         requireNotBlank(task.archiveSqlTemplate, "archiveSqlTemplate");
+        if (task.isPartitionTable == null) {
+            throw new IllegalArgumentException("isPartitionTable is null");
+        }
     }
 
     private static void validateTemplate(String template) {
@@ -278,11 +276,6 @@ public class UzsAutoTransfer {
         return template.replaceAll(placeholderRegex, Matcher.quoteReplacement(replacement));
     }
 
-    private static boolean containsPlaceholder(String template, String key) {
-        String placeholderRegex = "\\{\\{\\s*" + Pattern.quote(key) + "\\s*}}";
-        return Pattern.compile(placeholderRegex).matcher(template).find();
-    }
-
     private static String escapeIdentifier(String identifier) {
         requireNotBlank(identifier, "identifier");
         if (!IDENTIFIER_PATTERN.matcher(identifier).matches()) {
@@ -291,11 +284,39 @@ public class UzsAutoTransfer {
         return "`" + identifier + "`";
     }
 
-    private static String escapeStringLiteralValue(String value) {
-        if (value == null) {
-            throw new IllegalArgumentException("partitionDesc is null");
+    private static String buildPartitionPredicate(String partitionDesc) {
+        if (StringUtils.isBlank(partitionDesc)) {
+            throw new IllegalArgumentException("partition task requires partitionDesc");
         }
-        return value.replace("'", "''");
+        String[] segments = partitionDesc.split(",");
+        List<String> predicates = new ArrayList<>();
+        for (String segment : segments) {
+            String trimmed = segment.trim();
+            if (trimmed.isEmpty()) {
+                throw new IllegalArgumentException("partitionDesc contains empty segment");
+            }
+            int eqIndex = trimmed.indexOf('=');
+            if (eqIndex <= 0 || eqIndex == trimmed.length() - 1) {
+                throw new IllegalArgumentException("partitionDesc segment invalid: " + trimmed);
+            }
+            String key = trimmed.substring(0, eqIndex).trim();
+            String value = trimmed.substring(eqIndex + 1).trim();
+            if (key.isEmpty() || value.isEmpty()) {
+                throw new IllegalArgumentException("partitionDesc segment invalid: " + trimmed);
+            }
+            String escapedKey = escapeIdentifier(key);
+            String escapedValue = escapeSqlLiteral(value);
+            predicates.add(escapedKey + " = '" + escapedValue + "'");
+        }
+        return String.join(" AND ", predicates);
+    }
+
+    private static String appendPredicate(String sql, String predicate) {
+        String trimmedSql = sql.trim();
+        if (WHERE_PATTERN.matcher(trimmedSql).find()) {
+            return trimmedSql + " AND " + predicate;
+        }
+        return trimmedSql + " WHERE " + predicate;
     }
 
     private static boolean isRetryableTaskError(Throwable t) {

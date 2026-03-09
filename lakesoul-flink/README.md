@@ -23,6 +23,16 @@
 - `--transfer.sql-timeout-ms`：单任务 SQL 执行超时，默认 `1800000`
 - `--transfer.http-timeout-ms`：HTTP 请求超时，默认 `10000`
 
+## SQL 模板约定（archiveSqlTemplate）
+- 模板只提供转储主体，不要包含 `WHERE`，例如：
+  - `INSERT INTO {{dst_ns}}.{{dst_table}} SELECT * FROM {{src_ns}}.{{src_table}}`
+- 仅允许占位符：`{{src_ns}}`、`{{src_table}}`、`{{dst_ns}}`、`{{dst_table}}`
+- 分区任务（`isPartitionTable=true`）会自动根据 `partition_desc` 补充过滤条件：
+  - `dt_hour=2026-02-19-18` -> `` `dt_hour` = '2026-02-19-18' ``
+  - `plc_sub_system=fdb_plc_mf_db,year_month=2026-02,day=19,hour=19`
+    -> `` `plc_sub_system` = 'fdb_plc_mf_db' AND `year_month` = '2026-02' AND `day` = '19' AND `hour` = '19' ``
+- 非分区任务（`isPartitionTable=false`）不补充分区过滤，按全表转储执行。
+
 ## 运行示例
 ```bash
 flink run -c org.apache.flink.lakesoul.entry.transfer.UzsAutoTransfer lakesoul-flink.jar \
