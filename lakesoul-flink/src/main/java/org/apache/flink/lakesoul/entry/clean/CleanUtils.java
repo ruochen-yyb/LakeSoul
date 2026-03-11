@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.FileWriter;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
 import java.sql.*;
@@ -19,6 +20,7 @@ import java.util.regex.Pattern;
 public class CleanUtils {
 
     private static final Logger logger = LoggerFactory.getLogger(CleanUtils.class);
+    private final Map<String, Boolean> storageReachableCache = new HashMap<>();
 
     public void write(String record) {
         String filePath = "./record.txt";
@@ -66,14 +68,14 @@ public class CleanUtils {
         String sql = "DELETE FROM partition_info where table_id= '" + table_id +
                 "' and partition_desc ='" + partition_desc + "' and '" + commit_id + "' = ANY(snapshot)";
         try (PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
-            int rowsDeleted = preparedStatement.executeUpdate();
+            preparedStatement.executeUpdate();
         } catch (SQLException e) {
             e.printStackTrace();
             logger.info("删除partition_info数据异常");
         }
     }
 
-    public void cleanPartitionInfo(String table_id, String partition_desc, int version, Connection connection) throws SQLException {
+    public boolean cleanPartitionInfo(String table_id, String partition_desc, int version, Connection connection) {
         UUID id = UUID.randomUUID();
         logger.info("[Clean-{}]: begin", id);
         String sql = "DELETE FROM partition_info where table_id= '" + table_id +
@@ -82,10 +84,12 @@ public class CleanUtils {
             preparedStatement.executeUpdate();
             logger.info(sql);
             logger.info("[Clean-{}]: success",id);
+            return true;
         } catch (SQLException e) {
             e.printStackTrace();
             logger.info("删除partition_info数据异常");
             logger.info("[Clean-{}]: fail",id);
+            return false;
         }
     }
 
@@ -117,16 +121,91 @@ public class CleanUtils {
         Path path = new Path(filePath);
         URI uri = path.toUri();
         FileSystem fs = path.getFileSystem();
-        if (fs.exists(path)) {
+        if (!ensureStorageReachable(path, fs)) {
+            throw new IOException("storage unreachable for path: " + filePath);
+        }
+        if (pathExists(fs, path)) {
             // false: delete a single file only (non-recursive)
-            boolean deleted = fs.delete(path, false);
-            if (!deleted) {
-                throw new IOException("Flink FS returned false when deleting: " + filePath);
+            try {
+                boolean deleted = fs.delete(path, false);
+                if (!deleted && pathExists(fs, path)) {
+                    throw new IOException("Flink FS returned false when deleting: " + filePath);
+                }
+            } catch (IOException e) {
+                if (isNotFoundAfterReachable(e)) {
+                    logger.info("=============================Flink FS 文件不存在，按已清理处理: {} (scheme={})",
+                            filePath, uri.getScheme());
+                    return;
+                }
+                throw e;
             }
             logger.info("=============================Flink FS 文件已删除: {} (scheme={})", filePath, uri.getScheme());
         } else {
             logger.info("=============================Flink FS 文件不存在: {} (scheme={})", filePath, uri.getScheme());
         }
+    }
+
+    private boolean ensureStorageReachable(Path path, FileSystem fs) {
+        URI uri = path.toUri();
+        String scheme = uri.getScheme();
+        if (!isObjectStorageScheme(scheme)) {
+            return true;
+        }
+        String authority = uri.getAuthority();
+        if (authority == null || authority.isEmpty()) {
+            logger.warn("对象存储路径缺少 bucket/authority，跳过删除: {}", path);
+            return false;
+        }
+        String bucketKey = scheme + "://" + authority;
+        Boolean cached = storageReachableCache.get(bucketKey);
+        if (Boolean.TRUE.equals(cached)) {
+            return true;
+        }
+        Path bucketPath = new Path(bucketKey + "/");
+        try {
+            fs.exists(bucketPath);
+            storageReachableCache.put(bucketKey, true);
+            logger.info("对象存储桶连通性检查成功: {}", bucketKey);
+            return true;
+        } catch (IOException e) {
+            logger.error("对象存储桶连通性检查失败: {}", bucketKey, e);
+            return false;
+        }
+    }
+
+    private boolean pathExists(FileSystem fs, Path path) throws IOException {
+        try {
+            return fs.exists(path);
+        } catch (FileNotFoundException e) {
+            return false;
+        }
+    }
+
+    private boolean isObjectStorageScheme(String scheme) {
+        return "s3".equalsIgnoreCase(scheme)
+                || "s3a".equalsIgnoreCase(scheme)
+                || "s3n".equalsIgnoreCase(scheme);
+    }
+
+    private boolean isNotFoundAfterReachable(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof FileNotFoundException) {
+                return true;
+            }
+            String message = current.getMessage();
+            if (message != null) {
+                String lowerMessage = message.toLowerCase(Locale.ROOT);
+                if (lowerMessage.contains("404")
+                        || lowerMessage.contains("not found")
+                        || lowerMessage.contains("nosuchkey")
+                        || lowerMessage.contains("path does not exist")) {
+                    return true;
+                }
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
 
@@ -186,40 +265,16 @@ public class CleanUtils {
         boolean allOk = true;
         for (String commitId : snapshot) {
             boolean commitOk = true;
-            if (Boolean.TRUE.equals(oldCompaction)) {
-                logger.info("清理旧版压缩数据");
-                String sql = "SELECT \n" +
-                        "    dci.table_id, \n" +
-                        "    dci.partition_desc, \n" +
-                        "    dci.commit_id, \n" +
-                        "    file_op.path \n" +
-                        "FROM \n" +
-                        "    data_commit_info dci, \n" +
-                        "    unnest(dci.file_ops) AS file_op \n" +
-                        "WHERE \n" +
-                        "    dci.table_id = '" + tableId + "' \n" +
-                        "    AND dci.partition_desc = '" + partitionDesc + "' \n" +
-                        "    AND dci.commit_id = '" + commitId + "'";
-                try (PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
-                    ResultSet pathSet = preparedStatement.executeQuery();
-                    logger.info(sql);
-                    List<String> oldCompactionFileList = new ArrayList<>();
-                    while (pathSet.next()) {
-                        String path = pathSet.getString("path");
-                        oldCompactionFileList.add(path);
-                    }
-                    if (!oldCompactionFileList.isEmpty()) {
-                        boolean deleted = deleteFile(oldCompactionFileList);
-                        if (!deleted) {
-                            commitOk = false;
-                            logger.warn("旧版压缩文件删除失败，跳过删除元数据。tableId={}, partitionDesc={}, commitId={}",
-                                    tableId, partitionDesc, commitId);
-                        }
-                    }
-                } catch (SQLException e) {
+            List<String> deleteTargets = collectDeleteTargets(connection, tableId, partitionDesc, commitId,
+                    Boolean.TRUE.equals(oldCompaction));
+            if (deleteTargets == null) {
+                commitOk = false;
+            } else if (!deleteTargets.isEmpty()) {
+                boolean deleted = deleteFile(deleteTargets);
+                if (!deleted) {
                     commitOk = false;
-                    logger.error("查询 data_commit_info.file_ops 失败，跳过删除元数据。tableId={}, partitionDesc={}, commitId={}",
-                            tableId, partitionDesc, commitId, e);
+                    logger.warn("文件删除失败，跳过删除元数据。tableId={}, partitionDesc={}, commitId={}",
+                            tableId, partitionDesc, commitId);
                 }
             }
 
@@ -241,6 +296,51 @@ public class CleanUtils {
             allOk = allOk && commitOk;
         }
         return allOk;
+    }
+
+    private List<String> collectDeleteTargets(Connection connection,
+                                              String tableId,
+                                              String partitionDesc,
+                                              String commitId,
+                                              boolean oldCompaction) {
+        String sql = "SELECT file_op.path \n" +
+                "FROM data_commit_info dci, \n" +
+                "    unnest(dci.file_ops) AS file_op \n" +
+                "WHERE dci.table_id = ? \n" +
+                "  AND dci.partition_desc = ? \n" +
+                "  AND dci.commit_id = ?";
+        LinkedHashSet<String> deleteTargets = new LinkedHashSet<>();
+        try (PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
+            preparedStatement.setString(1, tableId);
+            preparedStatement.setString(2, partitionDesc);
+            preparedStatement.setObject(3, UUID.fromString(commitId));
+            ResultSet pathSet = preparedStatement.executeQuery();
+            while (pathSet.next()) {
+                String path = pathSet.getString("path");
+                String deleteTarget = oldCompaction ? tryResolveCompactDirectory(path) : path;
+                deleteTargets.add(deleteTarget == null ? path : deleteTarget);
+            }
+            if (oldCompaction) {
+                logger.info("清理旧版压缩数据，删除目标数: {}", deleteTargets.size());
+            }
+            return new ArrayList<>(deleteTargets);
+        } catch (Exception e) {
+            logger.error("查询 data_commit_info.file_ops 失败，跳过删除元数据。tableId={}, partitionDesc={}, commitId={}",
+                    tableId, partitionDesc, commitId, e);
+            return null;
+        }
+    }
+
+    private String tryResolveCompactDirectory(String filePath) {
+        int compactIndex = filePath.lastIndexOf("compact_");
+        if (compactIndex < 0) {
+            return filePath;
+        }
+        int nextDirectoryIndex = filePath.indexOf("/", compactIndex);
+        if (nextDirectoryIndex < 0) {
+            return filePath;
+        }
+        return filePath.substring(0, nextDirectoryIndex);
     }
 
     public void cleanDiscardFile(long expiredTime, Connection connection) throws SQLException {

@@ -196,11 +196,9 @@ public class NewCleanJob {
                     long compactTime = compactNewState.get(tableId + "/" + partitionDesc);
                     if (timestamp < compactTime - expiredTime) {
                         log.info("1:当前压缩版本是旧版本：" + compactVersion);
-                        boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                        boolean metadataOk = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
                                 pgConnection, compactVersion);
-                        if (ok) {
-                            cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
-                        } else {
+                        if (!(metadataOk && cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection))) {
                             // keep metadata/state for retry on timer
                             willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
                         }
@@ -221,11 +219,9 @@ public class NewCleanJob {
                         } else {
                             if (timestamp < compactTime - expiredTime) {
                                 log.info("2:当前压缩版本是旧版本：" + compactVersion);
-                                boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                                boolean metadataOk = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
                                         pgConnection, compactVersion);
-                                if (ok) {
-                                    cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
-                                } else {
+                                if (!(metadataOk && cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection))) {
                                     willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
                                 }
                             } else {
@@ -242,11 +238,9 @@ public class NewCleanJob {
                         long compactTime = compactNewState.get(tableId + "/" + partitionDesc);
                         if (timestamp < compactTime - expiredTime) {
                             log.info("3 当前压缩版本是旧版本： " + compactVersion);
-                            boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                            boolean metadataOk = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
                                     pgConnection, compactVersion);
-                            if (ok) {
-                                cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
-                            } else {
+                            if (!(metadataOk && cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection))) {
                                 willState.put(tableId + "/" + partitionDesc + "/" + version, willStateValue);
                             }
                         } else {
@@ -280,10 +274,9 @@ public class NewCleanJob {
                             PartitionInfo.WillStateValue stateValue = willStateEntry.getValue();
                             if (stateValue.timestamp < expiredThreshold) {
                                 log.info("4 当前压缩版本为旧版本：" + compactionVersionState.value());
-                                boolean ok = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
+                                boolean metadataOk = cleanUtils.deleteFileAndDataCommitInfo(snapshot, tableId, partitionDesc,
                                         pgConnection, compactionVersionState.value());
-                                if (ok) {
-                                    cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection);
+                                if (metadataOk && cleanUtils.cleanPartitionInfo(tableId, partitionDesc, version, pgConnection)) {
                                     willStateIterator.remove();
                                 } else {
                                     log.warn("清理失败，保留状态以便下次重试: tableId={}, partitionDesc={}, version={}",
