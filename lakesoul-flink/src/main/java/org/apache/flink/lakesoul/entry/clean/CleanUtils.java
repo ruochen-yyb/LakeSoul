@@ -22,6 +22,56 @@ public class CleanUtils {
     private static final Logger logger = LoggerFactory.getLogger(CleanUtils.class);
     private final Map<String, Boolean> storageReachableCache = new HashMap<>();
 
+    public enum FailureType {
+        NONE,
+        STORAGE_UNREACHABLE,
+        QUERY_FILE_OPS_FAILED,
+        FILE_DELETE_FAILED,
+        TRANSACTION_SETUP_FAILED,
+        DELETE_DATA_COMMIT_INFO_FAILED,
+        DELETE_PARTITION_INFO_FAILED,
+        METADATA_ROLLBACK_FAILED,
+        CONNECTION_STATE_RESTORE_FAILED
+    }
+
+    public static final class CleanupResult {
+        private final boolean success;
+        private final FailureType failureType;
+        private final String message;
+
+        private CleanupResult(boolean success, FailureType failureType, String message) {
+            this.success = success;
+            this.failureType = failureType;
+            this.message = message;
+        }
+
+        public static CleanupResult success() {
+            return new CleanupResult(true, FailureType.NONE, "success");
+        }
+
+        public static CleanupResult failure(FailureType failureType, String message) {
+            return new CleanupResult(false, failureType, message);
+        }
+
+        public boolean isSuccess() {
+            return success;
+        }
+
+        public FailureType getFailureType() {
+            return failureType;
+        }
+
+        public String getMessage() {
+            return message;
+        }
+    }
+
+    private static final class StorageUnreachableException extends IOException {
+        private StorageUnreachableException(String message) {
+            super(message);
+        }
+    }
+
     public void write(String record) {
         String filePath = "./record.txt";
         try (FileWriter writer = new FileWriter(filePath, true)) {
@@ -100,21 +150,27 @@ public class CleanUtils {
      * @return true if all deletions succeed (or files do not exist); false otherwise.
      */
     public boolean deleteFile(List<String> filePathList) {
+        return deleteFiles(filePathList).isSuccess();
+    }
+
+    private CleanupResult deleteFiles(List<String> filePathList) {
         UUID id = UUID.randomUUID();
         logger.info("[Clean-{}]: begin", id);
-        boolean hasError = false;
         for (String filePath : filePathList) {
             try {
                 deleteByFlinkFS(filePath);
+            } catch (StorageUnreachableException e) {
+                logger.error("[Clean-{}]: storage unreachable for path: {}", id, filePath, e);
+                return CleanupResult.failure(FailureType.STORAGE_UNREACHABLE,
+                        "storage unreachable: " + filePath);
             } catch (Exception e) {
-                hasError = true;
                 logger.error("[Clean-{}]: fail to delete path: {}", id, filePath, e);
+                return CleanupResult.failure(FailureType.FILE_DELETE_FAILED,
+                        "file delete failed: " + filePath);
             }
         }
-        if (!hasError) {
-            logger.info("[Clean-{}]: success", id);
-        }
-        return !hasError;
+        logger.info("[Clean-{}]: success", id);
+        return CleanupResult.success();
     }
 
     private void deleteByFlinkFS(String filePath) throws IOException {
@@ -122,7 +178,7 @@ public class CleanUtils {
         URI uri = path.toUri();
         FileSystem fs = path.getFileSystem();
         if (!ensureStorageReachable(path, fs)) {
-            throw new IOException("storage unreachable for path: " + filePath);
+            throw new StorageUnreachableException("storage unreachable for path: " + filePath);
         }
         if (pathExists(fs, path)) {
             // false: delete a single file only (non-recursive)
@@ -257,6 +313,32 @@ public class CleanUtils {
      *
      * @return true if all commits in snapshot are cleaned successfully; false otherwise.
      */
+    public CleanupResult cleanSnapshotAndPartitionInfo(List<String> snapshot,
+                                                       String tableId,
+                                                       String partitionDesc,
+                                                       int version,
+                                                       Connection connection,
+                                                       Boolean oldCompaction) {
+        LinkedHashSet<String> deleteTargets = new LinkedHashSet<>();
+        for (String commitId : snapshot) {
+            List<String> commitDeleteTargets = collectDeleteTargets(connection, tableId, partitionDesc, commitId,
+                    Boolean.TRUE.equals(oldCompaction));
+            if (commitDeleteTargets == null) {
+                return CleanupResult.failure(FailureType.QUERY_FILE_OPS_FAILED,
+                        String.format("query file_ops failed: tableId=%s, partitionDesc=%s, commitId=%s",
+                                tableId, partitionDesc, commitId));
+            }
+            deleteTargets.addAll(commitDeleteTargets);
+        }
+
+        CleanupResult deleteResult = deleteFiles(new ArrayList<>(deleteTargets));
+        if (!deleteResult.isSuccess()) {
+            return deleteResult;
+        }
+
+        return deleteMetadataInTransaction(snapshot, tableId, partitionDesc, version, connection);
+    }
+
     public boolean deleteFileAndDataCommitInfo(List<String> snapshot,
                                               String tableId,
                                               String partitionDesc,
@@ -296,6 +378,111 @@ public class CleanUtils {
             allOk = allOk && commitOk;
         }
         return allOk;
+    }
+
+    private CleanupResult deleteMetadataInTransaction(List<String> snapshot,
+                                                      String tableId,
+                                                      String partitionDesc,
+                                                      int version,
+                                                      Connection connection) {
+        CleanupResult result = CleanupResult.success();
+        boolean originalAutoCommit;
+        try {
+            originalAutoCommit = connection.getAutoCommit();
+            if (originalAutoCommit) {
+                connection.setAutoCommit(false);
+            }
+        } catch (SQLException e) {
+            logger.error("开启元数据删除事务失败。tableId={}, partitionDesc={}, version={}",
+                    tableId, partitionDesc, version, e);
+            return CleanupResult.failure(FailureType.TRANSACTION_SETUP_FAILED,
+                    String.format("transaction setup failed: tableId=%s, partitionDesc=%s, version=%s",
+                            tableId, partitionDesc, version));
+        }
+
+        try {
+            String deleteDataCommitInfoSql = "DELETE FROM data_commit_info \n" +
+                    "WHERE table_id = ? \n" +
+                    "AND commit_id = ? \n" +
+                    "AND partition_desc = ?";
+            try (PreparedStatement preparedStatement = connection.prepareStatement(deleteDataCommitInfoSql)) {
+                for (String commitId : snapshot) {
+                    preparedStatement.setString(1, tableId);
+                    preparedStatement.setObject(2, UUID.fromString(commitId));
+                    preparedStatement.setString(3, partitionDesc);
+                    preparedStatement.executeUpdate();
+                }
+            } catch (SQLException e) {
+                logger.error("删除 data_commit_info 失败，准备回滚。tableId={}, partitionDesc={}, version={}",
+                        tableId, partitionDesc, version, e);
+                result = rollbackAndBuildResult(connection,
+                        FailureType.DELETE_DATA_COMMIT_INFO_FAILED,
+                        String.format("delete data_commit_info failed: tableId=%s, partitionDesc=%s, version=%s",
+                                tableId, partitionDesc, version));
+                return result;
+            }
+
+            String deletePartitionInfoSql = "DELETE FROM partition_info \n" +
+                    "WHERE table_id = ? \n" +
+                    "AND partition_desc = ? \n" +
+                    "AND version = ?";
+            try (PreparedStatement preparedStatement = connection.prepareStatement(deletePartitionInfoSql)) {
+                preparedStatement.setString(1, tableId);
+                preparedStatement.setString(2, partitionDesc);
+                preparedStatement.setInt(3, version);
+                preparedStatement.executeUpdate();
+            } catch (SQLException e) {
+                logger.error("删除 partition_info 失败，准备回滚。tableId={}, partitionDesc={}, version={}",
+                        tableId, partitionDesc, version, e);
+                result = rollbackAndBuildResult(connection,
+                        FailureType.DELETE_PARTITION_INFO_FAILED,
+                        String.format("delete partition_info failed: tableId=%s, partitionDesc=%s, version=%s",
+                                tableId, partitionDesc, version));
+                return result;
+            }
+
+            connection.commit();
+            logger.info("元数据删除事务提交成功。tableId={}, partitionDesc={}, version={}, snapshotSize={}",
+                    tableId, partitionDesc, version, snapshot.size());
+            result = CleanupResult.success();
+        } catch (SQLException e) {
+            logger.error("提交元数据删除事务失败，准备回滚。tableId={}, partitionDesc={}, version={}",
+                    tableId, partitionDesc, version, e);
+            result = rollbackAndBuildResult(connection,
+                    FailureType.DELETE_PARTITION_INFO_FAILED,
+                    String.format("metadata commit failed: tableId=%s, partitionDesc=%s, version=%s",
+                            tableId, partitionDesc, version));
+        } finally {
+            try {
+                if (originalAutoCommit) {
+                    connection.setAutoCommit(true);
+                }
+            } catch (SQLException e) {
+                logger.error("恢复 JDBC autoCommit 失败。tableId={}, partitionDesc={}, version={}",
+                        tableId, partitionDesc, version, e);
+                if (result.isSuccess()) {
+                    result = CleanupResult.failure(FailureType.CONNECTION_STATE_RESTORE_FAILED,
+                            String.format("connection state restore failed: tableId=%s, partitionDesc=%s, version=%s",
+                                    tableId, partitionDesc, version));
+                }
+            }
+        }
+        return result;
+    }
+
+    private CleanupResult rollbackAndBuildResult(Connection connection,
+                                                 FailureType failureType,
+                                                 String failureMessage) {
+        try {
+            connection.rollback();
+            logger.warn("元数据删除事务已回滚: failureType={}, detail={}", failureType, failureMessage);
+            return CleanupResult.failure(failureType, failureMessage);
+        } catch (SQLException rollbackException) {
+            logger.error("元数据删除事务回滚失败: failureType={}, detail={}",
+                    failureType, failureMessage, rollbackException);
+            return CleanupResult.failure(FailureType.METADATA_ROLLBACK_FAILED,
+                    failureMessage + "; rollback failed");
+        }
     }
 
     private List<String> collectDeleteTargets(Connection connection,

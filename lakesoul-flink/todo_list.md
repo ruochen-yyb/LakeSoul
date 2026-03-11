@@ -7,3 +7,6 @@
 - 步骤1：已完成，`CleanUtils` 统一按 `snapshot -> file_ops` 删文件并区分普通文件/compact 目录。
 - 步骤2：已完成，补了 S3 桶连通性检查与“文件不存在可清理”处理。
 - 步骤3：已完成，`NewCleanJob` 在任一步失败时保留状态等待下次重试。
+- 新问题：`data_commit_info` 与 `partition_info` 删除未处于同一事务，存在半成功风险。
+- 新方案：文件删除成功后，元数据删除改为单事务提交，并补 `rollback` 日志与失败分类。
+- 新验证：检查失败时 `rollback` 日志、`failureType` 输出，以及状态保留逻辑。
