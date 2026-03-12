@@ -21,6 +21,7 @@ public class BinaryDebeziumDeserializationSchema implements DebeziumDeserializat
     private final String targetNamespace;
     private final String tableFormat;
     private final String namingCase;
+    private final String sourceDbType;
 
     public BinaryDebeziumDeserializationSchema(LakeSoulRecordConvert convert, String basePath) {
         this.convert = convert;
@@ -29,6 +30,7 @@ public class BinaryDebeziumDeserializationSchema implements DebeziumDeserializat
         this.targetNamespace = null;
         this.tableFormat = null;
         this.namingCase = "preserve";
+        this.sourceDbType = "mysql";
     }
 
     public BinaryDebeziumDeserializationSchema(LakeSoulRecordConvert convert, String basePath, Configuration conf) {
@@ -38,13 +40,14 @@ public class BinaryDebeziumDeserializationSchema implements DebeziumDeserializat
         this.targetNamespace = conf.get(LakeSoulSinkOptions.NAMING_TARGET_NAMESPACE);
         this.tableFormat = conf.get(LakeSoulSinkOptions.NAMING_TABLE_FORMAT);
         this.namingCase = conf.get(LakeSoulSinkOptions.NAMING_CASE);
+        this.sourceDbType = conf.get(org.apache.flink.lakesoul.tool.LakeSoulDDLSinkOptions.SOURCE_DB_TYPE);
     }
 
     @Override
     public void deserialize(SourceRecord sourceRecord, Collector<BinarySourceRecord> collector) throws Exception {
         // BinarySourceRecord binarySourceRecord = BinarySourceRecord.fromMysqlSourceRecord(sourceRecord, this.convert, this.basePath);
         BinarySourceRecord binarySourceRecord = BinarySourceRecord.fromMysqlSourceRecord(sourceRecord, this.convert, this.basePath,
-            namingEnabled, targetNamespace, tableFormat, namingCase);
+            namingEnabled, targetNamespace, tableFormat, namingCase, sourceDbType);
         if (binarySourceRecord != null) collector.collect(binarySourceRecord);
     }
 

@@ -61,3 +61,13 @@
 - [x] 11.1 基于 `JdbcCDC#mongoCdc` 确认必须参数与默认行为（`db_type/db_name/host/schema_tables/batchSize` 等）
 - [x] 11.2 产出一条可直接运行的 `flink run -c org.apache.flink.lakesoul.entry.JdbcCDC ...` 示例命令（含 checkpoint、并行度、warehouse_path）
 - [x] 11.3 更新根目录 `README.md`：新增 “MongoDB CDC 多表同步” 小节与示例
+
+---
+
+## 12. MySQL CDC 目标表字段名强制小写
+
+- [x] 12.1 分析：字段名实际由 `BinarySourceRecord` / `LakeSoulRecordConvert` 生成，`JdbcCDC` 仅负责透传配置与建链路
+- [x] 12.2 确认方案：不新增参数；仅针对 MySQL CDC，将目标表字段名与主键名统一转小写
+- [x] 12.3 修改代码：`LakeSoulRecordConvert` 下沉字段名小写逻辑，覆盖顶层与嵌套字段 schema
+- [x] 12.4 修改代码：`BinarySourceRecord` 中 MySQL CDC 主键字段名同步转小写，保证与 `RowType` 一致
+- [x] 12.5 执行快速静态检查：仅检查本次改动文件的诊断

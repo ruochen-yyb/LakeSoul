@@ -49,6 +49,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.*;
 
+import static org.apache.flink.lakesoul.tool.LakeSoulDDLSinkOptions.SOURCE_DB_TYPE;
 import static org.apache.flink.lakesoul.tool.LakeSoulSinkOptions.CDC_CHANGE_COLUMN;
 import static org.apache.flink.lakesoul.tool.LakeSoulSinkOptions.CDC_CHANGE_COLUMN_DEFAULT;
 import static org.apache.flink.lakesoul.tool.LakeSoulSinkOptions.SORT_FIELD;
@@ -64,6 +65,8 @@ public class LakeSoulRecordConvert implements Serializable {
 
     final boolean useCDC;
 
+    private final String sourceDbType;
+
     List<String> partitionFields;
 
 
@@ -74,6 +77,7 @@ public class LakeSoulRecordConvert implements Serializable {
     public LakeSoulRecordConvert(Configuration conf, String serverTimeZone, List<String> partitionFields) {
         this.useCDC = conf.getBoolean(USE_CDC);
         this.cdcColumn = conf.getString(CDC_CHANGE_COLUMN, CDC_CHANGE_COLUMN_DEFAULT);
+        this.sourceDbType = conf.get(SOURCE_DB_TYPE);
         this.serverTimeZone = ZoneId.of(serverTimeZone);
         this.partitionFields = partitionFields;
     }
@@ -234,7 +238,7 @@ public class LakeSoulRecordConvert implements Serializable {
         List<Field> fieldNames = schema.fields();
         for (int i = 0; i < (useCDC ? arity - 2 : arity - 1); i++) {
             Field item = fieldNames.get(i);
-            colNames[i] = item.name();
+            colNames[i] = normalizeFieldName(item.name());
             if (isMongoDDL){
                 colTypes[i] = convertToLogical(item.schema(), !item.name().equals("_id"));
             }else {
@@ -262,13 +266,27 @@ public class LakeSoulRecordConvert implements Serializable {
         List<RowType.RowField> rowFields = new ArrayList<>();
 
         for (Field field : schema.fields()) {
-            String fieldName = field.name();
+            String fieldName = normalizeFieldName(field.name());
             Schema fieldype = field.schema();
             LogicalType logicalType = convertToLogical(fieldype ,true);
             RowType.RowField rowField = new RowType.RowField(fieldName, logicalType);
             rowFields.add(rowField);
         }
         return rowFields;
+    }
+
+    private String normalizeFieldName(String fieldName) {
+        if (fieldName == null) {
+            return null;
+        }
+        if (shouldLowercaseMysqlFieldNames()) {
+            return fieldName.toLowerCase(Locale.ROOT);
+        }
+        return fieldName;
+    }
+
+    private boolean shouldLowercaseMysqlFieldNames() {
+        return "mysql".equalsIgnoreCase(sourceDbType);
     }
 
     private LogicalType primitiveLogicalType(Schema fieldSchema,boolean nullable) {

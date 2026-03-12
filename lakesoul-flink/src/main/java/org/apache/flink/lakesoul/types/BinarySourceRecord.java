@@ -17,6 +17,7 @@ import org.apache.flink.lakesoul.tool.FlinkUtil;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 public class BinarySourceRecord {
 
@@ -67,7 +68,7 @@ public class BinarySourceRecord {
     public static BinarySourceRecord fromMysqlSourceRecord(SourceRecord sourceRecord,
                                                            LakeSoulRecordConvert convert,
                                                            String basePath) throws Exception {
-                return fromMysqlSourceRecord(sourceRecord, convert, basePath, false, null, null, "preserve");
+                return fromMysqlSourceRecord(sourceRecord, convert, basePath, false, null, null, "preserve", "mysql");
     }
 
     public static BinarySourceRecord fromMysqlSourceRecord(SourceRecord sourceRecord,
@@ -76,7 +77,8 @@ public class BinarySourceRecord {
                                                            boolean namingEnabled,
                                                            String targetNamespace,
                                                            String tableFormat,
-                                                           String namingCase) throws Exception {
+                                                           String namingCase,
+                                                           String sourceDbType) throws Exception {
         Schema keySchema = sourceRecord.keySchema();
         TableId tableId = new TableId(io.debezium.relational.TableId.parse(sourceRecord.topic()).toLowercase());
         boolean isDDL = "io.debezium.connector.mysql.SchemaChangeKey".equalsIgnoreCase(keySchema.name());
@@ -84,7 +86,7 @@ public class BinarySourceRecord {
             return null;
         } else {
             List<String> primaryKeys = new ArrayList<>();
-            keySchema.fields().forEach(f -> primaryKeys.add(f.name()));
+            keySchema.fields().forEach(f -> primaryKeys.add(normalizePrimaryKeyName(f.name(), sourceDbType)));
             Schema valueSchema = sourceRecord.valueSchema();
             Struct value = (Struct) sourceRecord.value();
 
@@ -146,6 +148,16 @@ public class BinarySourceRecord {
                     Collections.emptyList(), false, data, null);
    
         }
+    }
+
+    private static String normalizePrimaryKeyName(String primaryKey, String sourceDbType) {
+        if (primaryKey == null) {
+            return null;
+        }
+        if ("mysql".equalsIgnoreCase(sourceDbType)) {
+            return primaryKey.toLowerCase(Locale.ROOT);
+        }
+        return primaryKey;
     }
 
     public String getTopic() {
