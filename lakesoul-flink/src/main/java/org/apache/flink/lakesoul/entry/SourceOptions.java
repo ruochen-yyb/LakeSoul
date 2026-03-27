@@ -24,6 +24,7 @@ public class SourceOptions {
     public static final ConfigOption<Long> ONTIMER_INTERVAL = ConfigOptions.key("ontimer_interval").longType().noDefaultValue();
     public static final ConfigOption<String> TARGET_IDS = ConfigOptions.key("targetTableID").stringType().noDefaultValue();
     public static final ConfigOption<String> TARGET_TABLES =ConfigOptions.key("targetTableName").stringType().noDefaultValue();
+    public static final ConfigOption<Integer> DISCARD_BATCH_SIZE = ConfigOptions.key("discardBatchSize").intType().defaultValue(1000).withDescription("discard clean batch size");
     public SourceOptions() {
     }
 }

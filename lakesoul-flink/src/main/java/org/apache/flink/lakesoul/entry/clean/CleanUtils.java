@@ -72,6 +72,16 @@ public class CleanUtils {
         }
     }
 
+    private static final class DiscardFileRecord {
+        private final long timestamp;
+        private final String filePath;
+
+        private DiscardFileRecord(long timestamp, String filePath) {
+            this.timestamp = timestamp;
+            this.filePath = filePath;
+        }
+    }
+
     public void write(String record) {
         String filePath = "./record.txt";
         try (FileWriter writer = new FileWriter(filePath, true)) {
@@ -530,32 +540,72 @@ public class CleanUtils {
         return filePath.substring(0, nextDirectoryIndex);
     }
 
-    public void cleanDiscardFile(long expiredTime, Connection connection) throws SQLException {
+    public void cleanDiscardFile(long expiredTime, int batchSize, Connection connection) throws SQLException {
         logger.info("expiredTime: " + expiredTime);
         logger.info("从discard_compressed_file_info表中清理过期数据");
         System.out.println("从discard_compressed_file_info表中清理过期数据");
-        long currentTimeMillis = System.currentTimeMillis();
-        String querySql = "SELECT file_path FROM discard_compressed_file_info WHERE timestamp < ?";
+        long expiredThreshold = System.currentTimeMillis() - expiredTime;
+        int effectiveBatchSize = Math.max(batchSize, 1);
         String deleteSql = "DELETE FROM discard_compressed_file_info WHERE file_path = ?";
-        try (
-                PreparedStatement selectStmt = connection.prepareStatement(querySql);
-                PreparedStatement deleteStmt = connection.prepareStatement(deleteSql)
-        ) {
-            selectStmt.setLong(1, currentTimeMillis - expiredTime);
-            ResultSet resultSet = selectStmt.executeQuery();
+        try (PreparedStatement deleteStmt = connection.prepareStatement(deleteSql)) {
+            DiscardFileRecord lastRecord = null;
+            while (true) {
+                List<DiscardFileRecord> batch = fetchDiscardBatch(connection, expiredThreshold, effectiveBatchSize, lastRecord);
+                if (batch.isEmpty()) {
+                    break;
+                }
+                cleanDiscardBatch(batch, deleteStmt);
+                lastRecord = batch.get(batch.size() - 1);
+            }
+        }
+    }
 
-            while (resultSet.next()) {
-                String filePath = resultSet.getString("file_path");
-                boolean ok = deleteFile(Collections.singletonList(filePath));
-                if (ok) {
-                    deleteStmt.setString(1, filePath);
-                    deleteStmt.executeUpdate();
-                } else {
-                    logger.warn("discard_compressed_file_info 文件删除失败，保留元数据以便重试: {}", filePath);
+    private List<DiscardFileRecord> fetchDiscardBatch(Connection connection, long expiredThreshold,
+                                                      int batchSize, DiscardFileRecord lastRecord) throws SQLException {
+        String firstPageSql = "SELECT file_path, timestamp FROM discard_compressed_file_info " +
+                "WHERE timestamp < ? ORDER BY timestamp, file_path LIMIT ?";
+        String nextPageSql = "SELECT file_path, timestamp FROM discard_compressed_file_info " +
+                "WHERE timestamp < ? AND (timestamp > ? OR (timestamp = ? AND file_path > ?)) " +
+                "ORDER BY timestamp, file_path LIMIT ?";
+        List<DiscardFileRecord> batch = new ArrayList<>(batchSize);
+        try (PreparedStatement selectStmt = connection.prepareStatement(lastRecord == null ? firstPageSql : nextPageSql)) {
+            selectStmt.setFetchSize(batchSize);
+            selectStmt.setLong(1, expiredThreshold);
+            if (lastRecord == null) {
+                selectStmt.setInt(2, batchSize);
+            } else {
+                selectStmt.setLong(2, lastRecord.timestamp);
+                selectStmt.setLong(3, lastRecord.timestamp);
+                selectStmt.setString(4, lastRecord.filePath);
+                selectStmt.setInt(5, batchSize);
+            }
+            try (ResultSet resultSet = selectStmt.executeQuery()) {
+                while (resultSet.next()) {
+                    batch.add(new DiscardFileRecord(
+                            resultSet.getLong("timestamp"),
+                            resultSet.getString("file_path")));
                 }
             }
         }
+        return batch;
+    }
 
+    private void cleanDiscardBatch(List<DiscardFileRecord> batch, PreparedStatement deleteStmt) throws SQLException {
+        int metadataDeleteCount = 0;
+        int failedCount = 0;
+        for (DiscardFileRecord record : batch) {
+            boolean ok = deleteFile(Collections.singletonList(record.filePath));
+            if (ok) {
+                deleteStmt.setString(1, record.filePath);
+                deleteStmt.executeUpdate();
+                metadataDeleteCount++;
+            } else {
+                failedCount++;
+                logger.warn("discard_compressed_file_info 文件删除失败，保留元数据以便重试: {}", record.filePath);
+            }
+        }
+        logger.info("discard_compressed_file_info 当前批处理完成，batchSize={}, metadataDeleteCount={}, failedCount={}",
+                batch.size(), metadataDeleteCount, failedCount);
     }
 
 

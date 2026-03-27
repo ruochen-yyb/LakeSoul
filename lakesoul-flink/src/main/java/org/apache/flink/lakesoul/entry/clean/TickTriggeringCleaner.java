@@ -19,12 +19,14 @@ public class TickTriggeringCleaner extends RichCoFlatMapFunction<String, Partiti
     private String userName;
     private String passWord;
     private long expiredTime;
+    private int discardBatchSize;
 
-    public TickTriggeringCleaner(String pgUrl, String userName, String passWord, long expiredTime) {
+    public TickTriggeringCleaner(String pgUrl, String userName, String passWord, long expiredTime, int discardBatchSize) {
         this.pgUrl = pgUrl;
         this.userName = userName;
         this.passWord = passWord;
         this.expiredTime = expiredTime;
+        this.discardBatchSize = discardBatchSize;
     }
 
     @Override
@@ -36,7 +38,7 @@ public class TickTriggeringCleaner extends RichCoFlatMapFunction<String, Partiti
     @Override
     public void flatMap1(String tick, Collector<PartitionInfo> out) {
         try (Connection connection = DriverManager.getConnection(pgUrl, userName, passWord)) {
-            cleanUtils.cleanDiscardFile(expiredTime, connection);
+            cleanUtils.cleanDiscardFile(expiredTime, discardBatchSize, connection);
         } catch (SQLException e) {
             System.err.println("Failed to connect to database: " + e.getMessage());
             e.printStackTrace();

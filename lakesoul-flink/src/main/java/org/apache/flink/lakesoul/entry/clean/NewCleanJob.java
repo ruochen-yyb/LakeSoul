@@ -45,6 +45,7 @@ public class NewCleanJob {
     private static int sourceParallelism;
     private static CleanUtils cleanUtils;
     private static String targetTables;
+    private static int discardBatchSize;
 
     public static void main(String[] args) throws Exception {
         ParameterTool parameter = ParameterTool.fromArgs(args);
@@ -66,6 +67,8 @@ public class NewCleanJob {
         sourceParallelism = parameter.getInt(SourceOptions.SOURCE_PARALLELISM.key(),
                 SourceOptions.SOURCE_PARALLELISM.defaultValue());
         targetTables = parameter.get(SourceOptions.TARGET_TABLES.key(), null);
+        discardBatchSize = parameter.getInt(SourceOptions.DISCARD_BATCH_SIZE.key(),
+                SourceOptions.DISCARD_BATCH_SIZE.defaultValue());
 
         // int ontimerInterval = 60000;
         int ontimerInterval = parameter.getInt(SourceOptions.ONTIMER_INTERVAL.key(), 5) * 60000;
@@ -110,7 +113,7 @@ public class NewCleanJob {
                 .filter(Objects::nonNull);
 
         SingleOutputStreamOperator<PartitionInfo> streamOperator = tickStream.connect(filter)
-                .flatMap(new TickTriggeringCleaner(pgUrl, userName, passWord, expiredTime));
+                .flatMap(new TickTriggeringCleaner(pgUrl, userName, passWord, expiredTime, discardBatchSize));
 
         streamOperator.keyBy(value -> value.table_id + "/" + value.partition_desc)
                 .process(new ProcessClean(pgUrl, userName, passWord, expiredTime, ontimerInterval));
