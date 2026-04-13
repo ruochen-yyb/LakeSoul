@@ -10,6 +10,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.TableResult;
@@ -118,14 +119,19 @@ public class UzsAutoTransfer {
         int consecutiveFails = 0;
 
         LOG.info("UzsAutoTransfer started: apiBaseUrl={}, claimedBy={}", apiBaseUrl, claimedBy);
+        LOG.info("UzsAutoTransfer config: noTaskSleepMs={}, retryableFailSleepMs={}, maxConsecutiveFails={}, circuitBreakerSleepMs={}, doneRetryMaxAttempts={}, doneRetrySleepMs={}, sqlTimeoutMs={}, httpTimeoutMs={}",
+                noTaskSleepMs, retryableFailSleepMs, maxConsecutiveFails, circuitBreakerSleepMs,
+                doneRetryMaxAttempts, doneRetrySleepMs, sqlTimeoutMs, httpTimeoutMs);
         while (true) {
             try {
                 TransferTask task = apiClient.getTransferTask();
                 if (task == null) {
+                    LOG.info("transfer task stage=no-task sleepMs={}", noTaskSleepMs);
                     sleep(noTaskSleepMs, "no task");
                     continue;
                 }
                 stats.claimed.incrementAndGet();
+                LOG.info("transfer task stage=claimed summary={}", summarizeTask(task));
                 ProcessResult result = processTask(task, apiClient, tableEnv, sqlTimeoutMs, doneRetryMaxAttempts, doneRetrySleepMs);
                 stats.totalElapsedMs.addAndGet(result.elapsedMs);
                 if (result.success) {
@@ -160,25 +166,41 @@ public class UzsAutoTransfer {
         String taskTag = task.tableId + "|" + safe(task.partitionDesc) + "|" + task.version;
         long startMs = System.currentTimeMillis();
         try {
+            logTaskStage(taskTag, "validate-start", "summary=" + summarizeTask(task));
             validateTask(task);
+            logTaskStage(taskTag, "validate-done", "summary=" + summarizeTask(task));
             String sql = renderAndValidateSql(task);
             String sqlDigest = Integer.toHexString(sql.hashCode());
-            LOG.info("start transfer task={}, src={}.{}, dst={}.{}, sqlDigest={}",
-                    taskTag, task.tableNamespace, task.tableName, task.archiveTargetTableNamespace, task.archiveTargetTableName, sqlDigest);
+            LOG.info("start transfer task={}, src={}.{}, dst={}.{}, sqlDigest={}, sqlLength={}",
+                    taskTag, task.tableNamespace, task.tableName, task.archiveTargetTableNamespace, task.archiveTargetTableName, sqlDigest, sql.length());
+            logTaskStage(taskTag, "sql-rendered", "sqlDigest=" + sqlDigest + ", sqlLength=" + sql.length());
             LOG.info("transfer sql task={}, isPartitionTable={}, partitionDesc={}, sql=\n{}",
                     taskTag, task.isPartitionTable, safe(task.partitionDesc), sql);
 
+            logTaskStage(taskTag, "flink-submit-start", "executeSql begin");
             TableResult tableResult = tableEnv.executeSql(sql);
+            Optional<JobClient> jobClient = tableResult.getJobClient();
+            if (jobClient.isPresent()) {
+                logTaskStage(taskTag, "flink-submit-done", "jobId=" + jobClient.get().getJobID());
+            } else {
+                logTaskStage(taskTag, "flink-submit-done", "jobId=<empty>");
+            }
+            logTaskStage(taskTag, "flink-await-start", "timeoutMs=" + sqlTimeoutMs + ", resultKind=" + tableResult.getResultKind());
             tableResult.await(sqlTimeoutMs, TimeUnit.MILLISECONDS);
+            logTaskStage(taskTag, "flink-await-done", "resultKind=" + tableResult.getResultKind());
 
+            logTaskStage(taskTag, "callback-done-start", "attempts=" + doneRetryMaxAttempts);
             callbackDoneWithRetry(task, apiClient, doneRetryMaxAttempts, doneRetrySleepMs);
+            logTaskStage(taskTag, "callback-done-finished", "done");
             long elapsed = System.currentTimeMillis() - startMs;
             LOG.info("transfer task done={}, costMs={}", taskTag, elapsed);
             return ProcessResult.success(elapsed);
         } catch (Throwable taskError) {
-            LOG.error("transfer task failed={}", taskTag, taskError);
+            LOG.error("transfer task failed={}, retryable={}", taskTag, isRetryableTaskError(taskError), taskError);
             try {
+                logTaskStage(taskTag, "callback-err-start", "message=" + buildErrorMessage(taskError));
                 apiClient.setTaskErr(task, buildErrorMessage(taskError));
+                logTaskStage(taskTag, "callback-err-finished", "reported");
             } catch (Throwable reportError) {
                 LOG.error("setTaskErr failed for task={}", taskTag, reportError);
             }
@@ -194,7 +216,9 @@ public class UzsAutoTransfer {
         Throwable latest = null;
         for (int i = 1; i <= maxAttempts; i++) {
             try {
+                LOG.info("setTaskDone attempt {}/{} task={}", i, maxAttempts, summarizeTask(task));
                 apiClient.setTaskDone(task);
+                LOG.info("setTaskDone success attempt {}/{} task={}", i, maxAttempts, summarizeTask(task));
                 return;
             } catch (Throwable t) {
                 latest = t;
@@ -394,6 +418,37 @@ public class UzsAutoTransfer {
                 claimed, success, failed, stats.callbackFailed.get(), avgCost, consecutiveFails);
     }
 
+    private static void logTaskStage(String taskTag, String stage, String detail) {
+        LOG.info("transfer task stage={} task={} detail={}", stage, taskTag, safe(detail));
+    }
+
+    private static String summarizeTask(TransferTask task) {
+        if (task == null) {
+            return "task=<null>";
+        }
+        return "tableId=" + safe(task.tableId)
+                + ", src=" + safe(task.tableNamespace) + "." + safe(task.tableName)
+                + ", dst=" + safe(task.archiveTargetTableNamespace) + "." + safe(task.archiveTargetTableName)
+                + ", isPartitionTable=" + task.isPartitionTable
+                + ", partitionDesc=" + safe(task.partitionDesc)
+                + ", version=" + task.version;
+    }
+
+    private static String summarizePayload(Map<String, Object> payload) {
+        List<String> parts = new ArrayList<>();
+        payload.forEach((key, value) -> parts.add(key + "=" + abbreviate(String.valueOf(value), 200)));
+        Collections.sort(parts);
+        return String.join(", ", parts);
+    }
+
+    private static String abbreviate(String value, int maxLen) {
+        String normalized = safe(value).replaceAll("\\s+", " ").trim();
+        if (normalized.length() <= maxLen) {
+            return normalized;
+        }
+        return normalized.substring(0, maxLen) + "...(truncated)";
+    }
+
     private static void initLakeSoulCatalog(TableEnvironment tableEnv,
                                             String catalogName,
                                             String warehouse,
@@ -513,11 +568,16 @@ public class UzsAutoTransfer {
                     .timeout(Duration.ofMillis(timeoutMs))
                     .GET()
                     .build();
-            String body = sendRequest(request);
+            String body = sendRequest(request, "claimedBy=" + claimedBy);
             ApiResponse<TransferTask> response = parseBody(body, new TypeReference<ApiResponse<TransferTask>>() {
             });
             if (response.code != 0) {
                 throw new ApiRequestException(-1, "getTransferTask failed: " + response.message);
+            }
+            if (response.data == null) {
+                LOG.info("getTransferTask result: no task, message={}", safe(response.message));
+            } else {
+                LOG.info("getTransferTask result: {}", summarizeTask(response.data));
             }
             return response.data;
         }
@@ -541,7 +601,7 @@ public class UzsAutoTransfer {
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                         .build();
-                String body = sendRequest(request);
+                String body = sendRequest(request, summarizePayload(payload));
                 ApiResponse<ApiErrorData> response = parseBody(body, new TypeReference<ApiResponse<ApiErrorData>>() {
                 });
                 if (response.code != 0) {
@@ -568,9 +628,15 @@ public class UzsAutoTransfer {
             return payload;
         }
 
-        private String sendRequest(HttpRequest request) throws IOException, InterruptedException {
+        private String sendRequest(HttpRequest request, String requestSummary) throws IOException, InterruptedException {
+            long startMs = System.currentTimeMillis();
+            LOG.info("transfer api request method={} uri={} summary={}",
+                    request.method(), request.uri(), abbreviate(requestSummary, 300));
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             int statusCode = response.statusCode();
+            long costMs = System.currentTimeMillis() - startMs;
+            LOG.info("transfer api response method={} uri={} status={} costMs={} body={}",
+                    request.method(), request.uri(), statusCode, costMs, abbreviate(response.body(), 500));
             if (statusCode < 200 || statusCode >= 300) {
                 throw new ApiRequestException(statusCode, "http status " + statusCode + ", body=" + response.body());
             }
