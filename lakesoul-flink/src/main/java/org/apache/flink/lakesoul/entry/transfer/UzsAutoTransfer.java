@@ -622,12 +622,10 @@ public class UzsAutoTransfer {
             Map<String, Object> payload = new HashMap<>();
             payload.put("workerId", claimedBy);
             payload.put("leaseMs", leaseMs);
-            String requestBody = OBJECT_MAPPER.writeValueAsString(payload);
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(apiBaseUrl + "/internal/tasks/transfer/claim"))
+                    .uri(buildUriWithParams("/internal/tasks/transfer/claim", payload))
                     .timeout(Duration.ofMillis(timeoutMs))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                    .POST(HttpRequest.BodyPublishers.noBody())
                     .build();
             String body = sendRequest(request, summarizePayload(payload));
             TransferClaimResult response = parseBody(body, new TypeReference<TransferClaimResult>() {
@@ -688,12 +686,10 @@ public class UzsAutoTransfer {
 
         private void callSetTask(String path, Map<String, Object> payload) throws IOException, InterruptedException {
             try {
-                String requestBody = OBJECT_MAPPER.writeValueAsString(payload);
                 HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(apiBaseUrl + path))
+                        .uri(buildUriWithParams(path, payload))
                         .timeout(Duration.ofMillis(timeoutMs))
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                        .POST(HttpRequest.BodyPublishers.noBody())
                         .build();
                 String body = sendRequest(request, summarizePayload(payload));
                 TransferSubmitResult response = parseBody(body, new TypeReference<TransferSubmitResult>() {
@@ -711,12 +707,19 @@ public class UzsAutoTransfer {
         private Map<String, Object> buildCallbackPayload(TransferTask task, String errorMessage) {
             Map<String, Object> payload = new HashMap<>();
             payload.put("tableId", task.tableId);
-            payload.put("partitionDesc", task.partitionDesc);
+            payload.put("partitionDesc", safe(task.partitionDesc));
             payload.put("claimToken", task.claimToken);
             if (StringUtils.isNotBlank(errorMessage)) {
                 payload.put("errorMessage", errorMessage);
             }
             return payload;
+        }
+
+        private URI buildUriWithParams(String path, Map<String, Object> params) {
+            List<String> queryParts = new ArrayList<>();
+            params.forEach((key, value) -> queryParts.add(encodeQueryParam(key) + "=" + encodeQueryParam(String.valueOf(value))));
+            Collections.sort(queryParts);
+            return URI.create(apiBaseUrl + path + "?" + String.join("&", queryParts));
         }
 
         private String sendRequest(HttpRequest request, String requestSummary) throws IOException, InterruptedException {
@@ -758,5 +761,9 @@ public class UzsAutoTransfer {
 
     private static String encodePathSegment(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
+    }
+
+    private static String encodeQueryParam(String value) {
+        return URLEncoder.encode(safe(value), StandardCharsets.UTF_8).replace("+", "%20");
     }
 }
