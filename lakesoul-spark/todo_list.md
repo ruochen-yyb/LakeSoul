@@ -46,3 +46,12 @@
 - [x] 增加 `setTaskDone` 优先回写与失败重试机制
 - [x] 增加错误分级退避（失败5分钟、无任务短轮询）
 - [x] 更新 `README.md` 的新参数与使用方式
+
+## UZS调度接口切换（本轮）
+- 问题：调度器 compaction worker API 已切换为 `/internal/tasks/compaction/*`。
+- 假设：worker 只需串行 `claim -> execute -> success/failure`，无任务时继续短轮询。
+- 方案：`UZSNewCompactionTask` 改用 `claim/success/failure`；任务模型补充 `claimToken/runVersion`。
+- 影响：启动参数增加 `lease.ms`，回写参数改为 query/form 风格。
+- 验证：覆盖 claim 无任务、成功回写、失败回写、非重试错误、网络重试。
+- [x] 更新 `UZSNewCompactionTask` 领取/回写链路到新 API
+- [x] 更新 `README.md` 使用方式与新增参数

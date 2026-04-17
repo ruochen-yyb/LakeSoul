@@ -12,7 +12,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.lakesoul.catalog.LakeSoulCatalog
 
-import java.io.{BufferedInputStream, DataOutputStream}
+import java.io.BufferedInputStream
 import java.net.{HttpURLConnection, URL, URLEncoder}
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
@@ -22,9 +22,10 @@ import scala.io.Source
 object UZSNewCompactionTask {
 
   val dateFormat: SimpleDateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss")
-  val CLAIM_TYPE_SPARK = "SPARK"
   val POLL_BASE_URL_PARAMETER = "poll.base.url"
+  val WORKER_ID_PARAMETER = "worker.id"
   val CLAIMED_BY_PARAMETER = "claimed.by"
+  val LEASE_MS_PARAMETER = "lease.ms"
   val NO_TASK_INTERVAL_MS_PARAMETER = "no.task.interval.ms"
   val EXECUTE_ERROR_BACKOFF_MS_PARAMETER = "execute.error.backoff.ms"
   val REQUEST_TIMEOUT_MS_PARAMETER = "request.timeout.ms"
@@ -35,7 +36,8 @@ object UZSNewCompactionTask {
   val ERR_RETRY_INTERVAL_MS_PARAMETER = "err.retry.interval.ms"
 
   var pollBaseUrl = "http://127.0.0.1:8080"
-  var claimedBy = "spark-worker"
+  var workerId = "spark-worker"
+  var leaseMs = 60000L
   var noTaskIntervalMs = 10000L
   var executeErrorBackoffMs = 300000L
   var requestTimeoutMs = 10000
@@ -51,7 +53,11 @@ object UZSNewCompactionTask {
                             tableNamespace: String,
                             isPartitionTable: Boolean,
                             partitionDesc: String,
-                            version: Int)
+                            version: Int,
+                            claimToken: String)
+
+  case class TaskExecutionResult(success: Boolean,
+                                 errorMessage: String)
 
   case class ApiResult(httpCode: Int,
                        code: Int,
@@ -62,7 +68,8 @@ object UZSNewCompactionTask {
   def main(args: Array[String]): Unit = {
     val parameter = ParametersTool.fromArgs(args)
     pollBaseUrl = parameter.get(POLL_BASE_URL_PARAMETER, pollBaseUrl).stripSuffix("/")
-    claimedBy = parameter.get(CLAIMED_BY_PARAMETER, claimedBy)
+    workerId = parameter.get(WORKER_ID_PARAMETER, parameter.get(CLAIMED_BY_PARAMETER, workerId))
+    leaseMs = parameter.getLong(LEASE_MS_PARAMETER, leaseMs)
     noTaskIntervalMs = parameter.getLong(NO_TASK_INTERVAL_MS_PARAMETER, noTaskIntervalMs)
     executeErrorBackoffMs = parameter.getLong(EXECUTE_ERROR_BACKOFF_MS_PARAMETER, executeErrorBackoffMs)
     requestTimeoutMs = parameter.getInt(REQUEST_TIMEOUT_MS_PARAMETER, requestTimeoutMs)
@@ -87,21 +94,22 @@ object UZSNewCompactionTask {
   }
 
   private def runPollingTaskLoop(): Unit = {
-    println(s"========== ${dateFormat.format(new Date())} start UZS polling worker: baseUrl=$pollBaseUrl claimedBy=$claimedBy ==========")
+    println(s"========== ${dateFormat.format(new Date())} start UZS polling worker: baseUrl=$pollBaseUrl workerId=$workerId leaseMs=$leaseMs ==========")
     while (true) {
       try {
         pollOneTask() match {
           case None =>
             Thread.sleep(noTaskIntervalMs)
           case Some(task) =>
-            if (executeCompactionTask(task)) {
+            val executionResult = executeCompactionTask(task)
+            if (executionResult.success) {
               val doneOk = reportDoneWithRetry(task)
               if (!doneOk) {
-                println(s"[WARN] ${dateFormat.format(new Date())} setTaskDone failed after retries, wait ${callbackFailureBackoffMs}ms")
+                println(s"[WARN] ${dateFormat.format(new Date())} compaction success callback failed after retries, wait ${callbackFailureBackoffMs}ms")
                 Thread.sleep(callbackFailureBackoffMs)
               }
             } else {
-              reportErrWithRetry(task)
+              reportErrWithRetry(task, executionResult.errorMessage)
               println(s"[WARN] ${dateFormat.format(new Date())} task execution failed, wait ${executeErrorBackoffMs}ms")
               Thread.sleep(executeErrorBackoffMs)
             }
@@ -115,19 +123,18 @@ object UZSNewCompactionTask {
   }
 
   private def pollOneTask(): Option[CompactionTask] = {
-    val encodedClaimedBy = URLEncoder.encode(claimedBy, StandardCharsets.UTF_8.name())
-    val url = s"$pollBaseUrl/getCompactionTask?claimedBy=$encodedClaimedBy"
-    val result = executeHttp(url, "GET", None)
+    val url = s"$pollBaseUrl/internal/tasks/compaction/claim?workerId=${urlEncode(workerId)}&leaseMs=$leaseMs"
+    val result = executeHttp(url, "POST")
 
-    if (result.code != 0) {
-      println(s"[WARN] ${dateFormat.format(new Date())} getCompactionTask failed http=${result.httpCode} code=${result.code} msg=${result.message}")
+    if (result.httpCode != 200 || result.code != 0) {
+      println(s"[WARN] ${dateFormat.format(new Date())} compaction claim failed http=${result.httpCode} code=${result.code} msg=${result.message}")
       None
     } else {
-      result.data.map(parseTask)
+      result.data.flatMap(parseClaimedTask)
     }
   }
 
-  private def executeCompactionTask(task: CompactionTask): Boolean = {
+  private def executeCompactionTask(task: CompactionTask): TaskExecutionResult = {
     val taskInfo = s"tableId=${task.tableId}, namespace=${task.tableNamespace}, table=${task.tableName}, partition=${task.partitionDesc}, version=${task.version}, isPartitionTable=${task.isPartitionTable}"
     println(s"========== ${dateFormat.format(new Date())} start task: $taskInfo ==========")
     try {
@@ -138,26 +145,27 @@ object UZSNewCompactionTask {
         table.uzsFullPartitionCompaction(partitionDescToCondition(task.partitionDesc))
       }
       println(s"========== ${dateFormat.format(new Date())} finish task success: $taskInfo ==========")
-      true
+      TaskExecutionResult(success = true, errorMessage = "")
     } catch {
       case e: Exception =>
-        println(s"[ERROR] ${dateFormat.format(new Date())} task execute failed: $taskInfo, err=${e.getMessage}")
-        false
+        val errorMessage = Option(e.getMessage).getOrElse(e.getClass.getSimpleName)
+        println(s"[ERROR] ${dateFormat.format(new Date())} task execute failed: $taskInfo, err=$errorMessage")
+        TaskExecutionResult(success = false, errorMessage = errorMessage)
     }
   }
 
   private def reportDoneWithRetry(task: CompactionTask): Boolean = {
     var attempt = 1
     while (attempt <= doneRetryMax) {
-      val result = reportTask(task, "setTaskDone")
+      val result = reportTaskSuccess(task)
       if (isCallbackSuccess(result)) {
         return true
       }
       if (!isRetryableCallbackFailure(result)) {
-        println(s"[ERROR] ${dateFormat.format(new Date())} setTaskDone non-retryable failed, http=${result.httpCode}, code=${result.code}, bizCode=${result.bizCode}, msg=${result.message}")
+        println(s"[ERROR] ${dateFormat.format(new Date())} compaction success callback non-retryable failed, http=${result.httpCode}, code=${result.code}, bizCode=${result.bizCode}, msg=${result.message}")
         return false
       }
-      println(s"[WARN] ${dateFormat.format(new Date())} setTaskDone retry attempt=$attempt/$doneRetryMax, http=${result.httpCode}, code=${result.code}, msg=${result.message}")
+      println(s"[WARN] ${dateFormat.format(new Date())} compaction success callback retry attempt=$attempt/$doneRetryMax, http=${result.httpCode}, code=${result.code}, msg=${result.message}")
       attempt += 1
       if (attempt <= doneRetryMax) {
         Thread.sleep(doneRetryIntervalMs)
@@ -166,19 +174,19 @@ object UZSNewCompactionTask {
     false
   }
 
-  private def reportErrWithRetry(task: CompactionTask): Unit = {
+  private def reportErrWithRetry(task: CompactionTask, errorMessage: String): Unit = {
     var attempt = 1
     while (attempt <= errRetryMax) {
-      val result = reportTask(task, "setTaskErr")
+      val result = reportTaskFailure(task, errorMessage)
       if (isCallbackSuccess(result)) {
-        println(s"[INFO] ${dateFormat.format(new Date())} setTaskErr success tableId=${task.tableId}, partition=${task.partitionDesc}, version=${task.version}")
+        println(s"[INFO] ${dateFormat.format(new Date())} compaction failure callback success tableId=${task.tableId}, partition=${task.partitionDesc}, version=${task.version}")
         return
       }
       if (!isRetryableCallbackFailure(result)) {
-        println(s"[ERROR] ${dateFormat.format(new Date())} setTaskErr non-retryable failed, http=${result.httpCode}, code=${result.code}, bizCode=${result.bizCode}, msg=${result.message}")
+        println(s"[ERROR] ${dateFormat.format(new Date())} compaction failure callback non-retryable failed, http=${result.httpCode}, code=${result.code}, bizCode=${result.bizCode}, msg=${result.message}")
         return
       }
-      println(s"[WARN] ${dateFormat.format(new Date())} setTaskErr retry attempt=$attempt/$errRetryMax, http=${result.httpCode}, code=${result.code}, msg=${result.message}")
+      println(s"[WARN] ${dateFormat.format(new Date())} compaction failure callback retry attempt=$attempt/$errRetryMax, http=${result.httpCode}, code=${result.code}, msg=${result.message}")
       attempt += 1
       if (attempt <= errRetryMax) {
         Thread.sleep(errRetryIntervalMs)
@@ -186,14 +194,16 @@ object UZSNewCompactionTask {
     }
   }
 
-  private def reportTask(task: CompactionTask, endpoint: String): ApiResult = {
-    val payload = new JsonObject()
-    payload.addProperty("claimType", CLAIM_TYPE_SPARK)
-    payload.addProperty("tableId", task.tableId)
-    payload.addProperty("partitionDesc", task.partitionDesc)
-    payload.addProperty("version", task.version)
-    val url = s"$pollBaseUrl/$endpoint"
-    executeHttp(url, "POST", Some(payload.toString))
+  private def reportTaskSuccess(task: CompactionTask): ApiResult = {
+    val url =
+      s"$pollBaseUrl/internal/tasks/compaction/success?tableId=${urlEncode(task.tableId)}&partitionDesc=${urlEncode(task.partitionDesc)}&claimToken=${urlEncode(task.claimToken)}"
+    executeHttp(url, "POST")
+  }
+
+  private def reportTaskFailure(task: CompactionTask, errorMessage: String): ApiResult = {
+    val url =
+      s"$pollBaseUrl/internal/tasks/compaction/failure?tableId=${urlEncode(task.tableId)}&partitionDesc=${urlEncode(task.partitionDesc)}&claimToken=${urlEncode(task.claimToken)}&errorMessage=${urlEncode(errorMessage)}"
+    executeHttp(url, "POST")
   }
 
   private def isCallbackSuccess(result: ApiResult): Boolean = {
@@ -212,6 +222,16 @@ object UZSNewCompactionTask {
         case _ =>
           result.code != 0
       }
+    }
+  }
+
+  private def parseClaimedTask(claimResponse: JsonObject): Option[CompactionTask] = {
+    val claimed =
+      claimResponse.has("claimed") && !claimResponse.get("claimed").isJsonNull && claimResponse.get("claimed").getAsBoolean
+    if (!claimed || !claimResponse.has("task") || claimResponse.get("task").isJsonNull || !claimResponse.get("task").isJsonObject) {
+      None
+    } else {
+      Some(parseTask(claimResponse.getAsJsonObject("task")))
     }
   }
 
@@ -234,11 +254,12 @@ object UZSNewCompactionTask {
       tableNamespace = getString("tableNamespace"),
       isPartitionTable = getBoolean("isPartitionTable"),
       partitionDesc = getString("partitionDesc"),
-      version = getInt("version")
+      version = getInt("runVersion", getInt("currentVersion")),
+      claimToken = getString("claimToken")
     )
   }
 
-  private def executeHttp(url: String, method: String, body: Option[String]): ApiResult = {
+  private def executeHttp(url: String, method: String): ApiResult = {
     var conn: HttpURLConnection = null
     try {
       conn = new URL(url).openConnection().asInstanceOf[HttpURLConnection]
@@ -246,15 +267,6 @@ object UZSNewCompactionTask {
       conn.setConnectTimeout(requestTimeoutMs)
       conn.setReadTimeout(requestTimeoutMs)
       conn.setRequestProperty("Accept", "application/json")
-
-      body.foreach(payload => {
-        conn.setDoOutput(true)
-        conn.setRequestProperty("Content-Type", "application/json")
-        val output = new DataOutputStream(conn.getOutputStream)
-        output.write(payload.getBytes(StandardCharsets.UTF_8))
-        output.flush()
-        output.close()
-      })
 
       val httpCode = conn.getResponseCode
       val stream = if (httpCode >= 200 && httpCode < 400) conn.getInputStream else conn.getErrorStream
@@ -273,10 +285,18 @@ object UZSNewCompactionTask {
   private def parseApiResult(httpCode: Int, responseBody: String): ApiResult = {
     try {
       val root = jsonParser.parse(responseBody).getAsJsonObject
-      val code = if (root.has("code") && !root.get("code").isJsonNull) root.get("code").getAsInt else httpCode
-      val message = if (root.has("message") && !root.get("message").isJsonNull) root.get("message").getAsString else ""
+      val hasEnvelope = root.has("code") || root.has("message") || root.has("data")
+      val code =
+        if (root.has("code") && !root.get("code").isJsonNull) root.get("code").getAsInt
+        else if (httpCode >= 200 && httpCode < 300) 0
+        else httpCode
+      val message =
+        if (root.has("message") && !root.get("message").isJsonNull) root.get("message").getAsString
+        else if (root.has("errorMessage") && !root.get("errorMessage").isJsonNull) root.get("errorMessage").getAsString
+        else ""
       val dataOpt =
         if (root.has("data") && root.get("data").isJsonObject) Some(root.getAsJsonObject("data"))
+        else if (!hasEnvelope) Some(root)
         else None
       val bizCode =
         if (dataOpt.exists(obj => obj.has("code") && !obj.get("code").isJsonNull)) dataOpt.get.get("code").getAsString
@@ -286,6 +306,10 @@ object UZSNewCompactionTask {
       case _: Exception =>
         ApiResult(httpCode, httpCode, responseBody, None, "")
     }
+  }
+
+  private def urlEncode(value: String): String = {
+    URLEncoder.encode(Option(value).getOrElse(""), StandardCharsets.UTF_8.name())
   }
 
   private def readStream(stream: java.io.InputStream): String = {
