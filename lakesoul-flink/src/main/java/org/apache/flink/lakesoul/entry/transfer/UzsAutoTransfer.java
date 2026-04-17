@@ -169,7 +169,6 @@ public class UzsAutoTransfer {
         long startMs = System.currentTimeMillis();
         try {
             logTaskStage(taskTag, "validate-start", "summary=" + summarizeTask(task));
-            apiClient.enrichTask(task);
             validateTask(task);
             logTaskStage(taskTag, "validate-done", "summary=" + summarizeTask(task));
             String sql = renderAndValidateSql(task);
@@ -322,9 +321,8 @@ public class UzsAutoTransfer {
         if (StringUtils.isBlank(partitionDesc)) {
             throw new IllegalArgumentException("partition task requires partitionDesc");
         }
-        String[] segments = partitionDesc.split(",");
         List<String> predicates = new ArrayList<>();
-        for (String segment : segments) {
+        for (String segment : splitPartitionSegments(partitionDesc)) {
             String trimmed = segment.trim();
             if (trimmed.isEmpty()) {
                 throw new IllegalArgumentException("partitionDesc contains empty segment");
@@ -343,6 +341,17 @@ public class UzsAutoTransfer {
             predicates.add(escapedKey + " = '" + escapedValue + "'");
         }
         return String.join(" AND ", predicates);
+    }
+
+    private static List<String> splitPartitionSegments(String partitionDesc) {
+        String normalized = partitionDesc.trim();
+        if (normalized.contains(",")) {
+            return Arrays.asList(normalized.split(","));
+        }
+        if (normalized.contains("/")) {
+            return Arrays.asList(normalized.split("/"));
+        }
+        return Collections.singletonList(normalized);
     }
 
     private static String appendPredicate(String sql, String predicate) {
@@ -589,18 +598,6 @@ public class UzsAutoTransfer {
         public String errorMessage;
     }
 
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    private static class TableFactStatus {
-        public String tableId;
-        public String tableName;
-        public String tableNamespace;
-        public Boolean partitionTable;
-        public Boolean transferEnabled;
-        public String transferTargetTableName;
-        public String transferTargetTableNamespace;
-        public String transferSqlTemplate;
-    }
-
     private static class TransferApiClient {
         private final String apiBaseUrl;
         private final String claimedBy;
@@ -639,39 +636,6 @@ public class UzsAutoTransfer {
             }
             LOG.info("claimTransferTask result: {}", summarizeTask(response.task));
             return response.task;
-        }
-
-        private void enrichTask(TransferTask task) throws IOException, InterruptedException {
-            TableFactStatus tableFact = getTableFact(task.tableId);
-            if (StringUtils.isNotBlank(tableFact.tableId) && !Objects.equals(task.tableId, tableFact.tableId)) {
-                throw new IllegalArgumentException("table fact mismatch, expected=" + task.tableId + ", actual=" + tableFact.tableId);
-            }
-            task.tableName = tableFact.tableName;
-            task.tableNamespace = tableFact.tableNamespace;
-            task.isPartitionTable = tableFact.partitionTable;
-            if (StringUtils.isBlank(task.targetTableName)) {
-                task.targetTableName = tableFact.transferTargetTableName;
-            }
-            if (StringUtils.isBlank(task.targetTableNamespace)) {
-                task.targetTableNamespace = tableFact.transferTargetTableNamespace;
-            }
-            if (StringUtils.isBlank(task.transferSqlTemplate)) {
-                task.transferSqlTemplate = tableFact.transferSqlTemplate;
-            }
-            if (Boolean.FALSE.equals(tableFact.transferEnabled)) {
-                throw new IllegalArgumentException("transfer disabled for tableId=" + task.tableId);
-            }
-        }
-
-        private TableFactStatus getTableFact(String tableId) throws IOException, InterruptedException {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(apiBaseUrl + "/internal/table/" + encodePathSegment(tableId)))
-                    .timeout(Duration.ofMillis(timeoutMs))
-                    .GET()
-                    .build();
-            String body = sendRequest(request, "tableId=" + tableId);
-            return parseBody(body, new TypeReference<TableFactStatus>() {
-            });
         }
 
         private void setTaskDone(TransferTask task) throws IOException, InterruptedException {
@@ -757,10 +721,6 @@ public class UzsAutoTransfer {
             url = url.substring(0, url.length() - 1);
         }
         return url;
-    }
-
-    private static String encodePathSegment(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
     private static String encodeQueryParam(String value) {

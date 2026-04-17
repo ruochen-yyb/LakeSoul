@@ -24,14 +24,21 @@
 - `--transfer.lease-ms`：任务 claim 租约时长，默认 `sqlTimeoutMs + 60000`，且必须大于 `sql-timeout-ms`
 - `--transfer.http-timeout-ms`：HTTP 请求超时，默认 `10000`
 
+## 新接口说明
+- worker 通过 `POST /internal/tasks/transfer/claim` 领取任务。
+- 新接口的 `claim` 响应已返回执行所需核心字段：`tableName`、`tableNamespace`、`isPartitionTable`、`targetTableName`、`targetTableNamespace`、`transferSqlTemplate`、`claimToken`。
+- 当前 worker 不再额外调用表事实查询接口补全任务信息。
+
 ## SQL 模板约定（transferSqlTemplate）
 - 模板只提供转储主体，不要包含 `WHERE`，例如：
   - `INSERT INTO {{dst_ns}}.{{dst_table}} SELECT * FROM {{src_ns}}.{{src_table}}`
 - 仅允许占位符：`{{src_ns}}`、`{{src_table}}`、`{{dst_ns}}`、`{{dst_table}}`
-- 分区任务（`isPartitionTable=true`）会自动根据 `partitionDesc` 补充过滤条件：
+- 分区任务（`isPartitionTable=true`）会自动根据 `partitionDesc` 补充过滤条件，当前同时兼容 `,` 和 `/` 作为分隔符：
   - `dt_hour=2026-02-19-18` -> `` `dt_hour` = '2026-02-19-18' ``
   - `plc_sub_system=fdb_plc_mf_db,year_month=2026-02,day=19,hour=19`
     -> `` `plc_sub_system` = 'fdb_plc_mf_db' AND `year_month` = '2026-02' AND `day` = '19' AND `hour` = '19' ``
+  - `dt=2026-04-16/country=cn`
+    -> `` `dt` = '2026-04-16' AND `country` = 'cn' ``
 - 非分区任务（`isPartitionTable=false`）不补充分区过滤，按全表转储执行。
 
 ## 运行示例
