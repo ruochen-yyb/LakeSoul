@@ -4,6 +4,7 @@
 
 package org.apache.flink.lakesoul.entry.transfer;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -36,10 +37,9 @@ public class UzsAutoTransfer {
     private static final Logger LOG = LoggerFactory.getLogger(UzsAutoTransfer.class);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    private static final String CLAIM_TYPE = "FLINK";
-
     private static final String API_BASE_URL = "transfer.api-base-url";
     private static final String CLAIMED_BY = "transfer.claimed-by";
+    private static final String LEASE_MS = "transfer.lease-ms";
     private static final String NO_TASK_SLEEP_MS = "transfer.no-task-sleep-ms";
     private static final String RETRYABLE_FAIL_SLEEP_MS = "transfer.retryable-fail-sleep-ms";
     private static final String MAX_CONSECUTIVE_FAILS = "transfer.max-consecutive-fails";
@@ -103,15 +103,16 @@ public class UzsAutoTransfer {
         long doneRetrySleepMs = parameter.getLong(DONE_RETRY_SLEEP_MS, DEFAULT_DONE_RETRY_SLEEP_MS);
         long sqlTimeoutMs = parameter.getLong(SQL_TIMEOUT_MS, DEFAULT_SQL_TIMEOUT_MS);
         long httpTimeoutMs = parameter.getLong(HTTP_TIMEOUT_MS, DEFAULT_HTTP_TIMEOUT_MS);
+        long leaseMs = parameter.getLong(LEASE_MS, sqlTimeoutMs + 60_000L);
 
         validateStartupArgs(doneRetryMaxAttempts, noTaskSleepMs, retryableFailSleepMs, maxConsecutiveFails,
-                circuitBreakerSleepMs, doneRetrySleepMs, sqlTimeoutMs, httpTimeoutMs);
+                circuitBreakerSleepMs, doneRetrySleepMs, sqlTimeoutMs, httpTimeoutMs, leaseMs);
         Stats stats = new Stats();
 
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(httpTimeoutMs))
                 .build();
-        TransferApiClient apiClient = new TransferApiClient(apiBaseUrl, claimedBy, httpClient, httpTimeoutMs, stats.callbackFailed);
+        TransferApiClient apiClient = new TransferApiClient(apiBaseUrl, claimedBy, leaseMs, httpClient, httpTimeoutMs, stats.callbackFailed);
 
         EnvironmentSettings settings = EnvironmentSettings.newInstance().inBatchMode().build();
         TableEnvironment tableEnv = TableEnvironment.create(settings);
@@ -119,12 +120,13 @@ public class UzsAutoTransfer {
         int consecutiveFails = 0;
 
         LOG.info("UzsAutoTransfer started: apiBaseUrl={}, claimedBy={}", apiBaseUrl, claimedBy);
-        LOG.info("UzsAutoTransfer config: noTaskSleepMs={}, retryableFailSleepMs={}, maxConsecutiveFails={}, circuitBreakerSleepMs={}, doneRetryMaxAttempts={}, doneRetrySleepMs={}, sqlTimeoutMs={}, httpTimeoutMs={}",
+        LOG.info("UzsAutoTransfer config: leaseMs={}, noTaskSleepMs={}, retryableFailSleepMs={}, maxConsecutiveFails={}, circuitBreakerSleepMs={}, doneRetryMaxAttempts={}, doneRetrySleepMs={}, sqlTimeoutMs={}, httpTimeoutMs={}",
+                leaseMs,
                 noTaskSleepMs, retryableFailSleepMs, maxConsecutiveFails, circuitBreakerSleepMs,
                 doneRetryMaxAttempts, doneRetrySleepMs, sqlTimeoutMs, httpTimeoutMs);
         while (true) {
             try {
-                TransferTask task = apiClient.getTransferTask();
+                TransferTask task = apiClient.claimTransferTask();
                 if (task == null) {
                     LOG.info("transfer task stage=no-task sleepMs={}", noTaskSleepMs);
                     sleep(noTaskSleepMs, "no task");
@@ -163,16 +165,17 @@ public class UzsAutoTransfer {
                                              long sqlTimeoutMs,
                                              int doneRetryMaxAttempts,
                                              long doneRetrySleepMs) {
-        String taskTag = task.tableId + "|" + safe(task.partitionDesc) + "|" + task.version;
+        String taskTag = task.tableId + "|" + safe(task.partitionDesc) + "|" + task.currentVersion;
         long startMs = System.currentTimeMillis();
         try {
             logTaskStage(taskTag, "validate-start", "summary=" + summarizeTask(task));
+            apiClient.enrichTask(task);
             validateTask(task);
             logTaskStage(taskTag, "validate-done", "summary=" + summarizeTask(task));
             String sql = renderAndValidateSql(task);
             String sqlDigest = Integer.toHexString(sql.hashCode());
             LOG.info("start transfer task={}, src={}.{}, dst={}.{}, sqlDigest={}, sqlLength={}",
-                    taskTag, task.tableNamespace, task.tableName, task.archiveTargetTableNamespace, task.archiveTargetTableName, sqlDigest, sql.length());
+                    taskTag, task.tableNamespace, task.tableName, task.targetTableNamespace, task.targetTableName, sqlDigest, sql.length());
             logTaskStage(taskTag, "sql-rendered", "sqlDigest=" + sqlDigest + ", sqlLength=" + sql.length());
             LOG.info("transfer sql task={}, isPartitionTable={}, partitionDesc={}, sql=\n{}",
                     taskTag, task.isPartitionTable, safe(task.partitionDesc), sql);
@@ -198,9 +201,13 @@ public class UzsAutoTransfer {
         } catch (Throwable taskError) {
             LOG.error("transfer task failed={}, retryable={}", taskTag, isRetryableTaskError(taskError), taskError);
             try {
-                logTaskStage(taskTag, "callback-err-start", "message=" + buildErrorMessage(taskError));
-                apiClient.setTaskErr(task, buildErrorMessage(taskError));
-                logTaskStage(taskTag, "callback-err-finished", "reported");
+                if (shouldReportFailure(taskError)) {
+                    logTaskStage(taskTag, "callback-err-start", "message=" + buildErrorMessage(taskError));
+                    apiClient.setTaskErr(task, buildErrorMessage(taskError));
+                    logTaskStage(taskTag, "callback-err-finished", "reported");
+                } else {
+                    logTaskStage(taskTag, "callback-err-skip", "reason=claim conflict");
+                }
             } catch (Throwable reportError) {
                 LOG.error("setTaskErr failed for task={}", taskTag, reportError);
             }
@@ -234,13 +241,13 @@ public class UzsAutoTransfer {
     }
 
     private static String renderAndValidateSql(TransferTask task) {
-        String template = task.archiveSqlTemplate;
+        String template = task.transferSqlTemplate;
         validateTemplate(template);
         String rendered = template;
         rendered = replacePlaceholder(rendered, PLACEHOLDER_SRC_NS, escapeIdentifier(task.tableNamespace));
         rendered = replacePlaceholder(rendered, PLACEHOLDER_SRC_TABLE, escapeIdentifier(task.tableName));
-        rendered = replacePlaceholder(rendered, PLACEHOLDER_DST_NS, escapeIdentifier(task.archiveTargetTableNamespace));
-        rendered = replacePlaceholder(rendered, PLACEHOLDER_DST_TABLE, escapeIdentifier(task.archiveTargetTableName));
+        rendered = replacePlaceholder(rendered, PLACEHOLDER_DST_NS, escapeIdentifier(task.targetTableNamespace));
+        rendered = replacePlaceholder(rendered, PLACEHOLDER_DST_TABLE, escapeIdentifier(task.targetTableName));
 
         if (Boolean.TRUE.equals(task.isPartitionTable)) {
             String partitionPredicate = buildPartitionPredicate(task.partitionDesc);
@@ -262,9 +269,10 @@ public class UzsAutoTransfer {
         requireNotBlank(task.tableId, "tableId");
         requireNotBlank(task.tableName, "tableName");
         requireNotBlank(task.tableNamespace, "tableNamespace");
-        requireNotBlank(task.archiveTargetTableName, "archiveTargetTableName");
-        requireNotBlank(task.archiveTargetTableNamespace, "archiveTargetTableNamespace");
-        requireNotBlank(task.archiveSqlTemplate, "archiveSqlTemplate");
+        requireNotBlank(task.targetTableName, "targetTableName");
+        requireNotBlank(task.targetTableNamespace, "targetTableNamespace");
+        requireNotBlank(task.transferSqlTemplate, "transferSqlTemplate");
+        requireNotBlank(task.claimToken, "claimToken");
         if (task.isPartitionTable == null) {
             throw new IllegalArgumentException("isPartitionTable is null");
         }
@@ -272,7 +280,7 @@ public class UzsAutoTransfer {
 
     private static void validateTemplate(String template) {
         if (StringUtils.isBlank(template)) {
-            throw new IllegalArgumentException("archiveSqlTemplate is blank");
+            throw new IllegalArgumentException("transferSqlTemplate is blank");
         }
 
         Matcher matcher = PLACEHOLDER_PATTERN.matcher(template);
@@ -346,7 +354,14 @@ public class UzsAutoTransfer {
     }
 
     private static boolean isRetryableTaskError(Throwable t) {
-        return !(t instanceof IllegalArgumentException);
+        if (t instanceof IllegalArgumentException) {
+            return false;
+        }
+        if (t instanceof ApiRequestException) {
+            ApiRequestException ex = (ApiRequestException) t;
+            return ex.statusCode >= 500 || ex.statusCode < 0;
+        }
+        return true;
     }
 
     private static boolean isRetryableCallbackError(Throwable t) {
@@ -360,6 +375,14 @@ public class UzsAutoTransfer {
     private static String buildErrorMessage(Throwable t) {
         String message = t.getClass().getSimpleName() + ": " + safe(t.getMessage());
         return message.length() > 1000 ? message.substring(0, 1000) : message;
+    }
+
+    private static boolean shouldReportFailure(Throwable t) {
+        if (t instanceof ApiRequestException) {
+            ApiRequestException ex = (ApiRequestException) t;
+            return ex.statusCode != 409;
+        }
+        return true;
     }
 
     private static void sleep(long ms, String reason) {
@@ -382,7 +405,8 @@ public class UzsAutoTransfer {
                                             long circuitBreakerSleepMs,
                                             long doneRetrySleepMs,
                                             long sqlTimeoutMs,
-                                            long httpTimeoutMs) {
+                                            long httpTimeoutMs,
+                                            long leaseMs) {
         if (doneRetryMaxAttempts < 1) {
             throw new IllegalArgumentException("--" + DONE_RETRY_MAX_ATTEMPTS + " must be >= 1");
         }
@@ -395,6 +419,10 @@ public class UzsAutoTransfer {
         requirePositive(doneRetrySleepMs, DONE_RETRY_SLEEP_MS);
         requirePositive(sqlTimeoutMs, SQL_TIMEOUT_MS);
         requirePositive(httpTimeoutMs, HTTP_TIMEOUT_MS);
+        requirePositive(leaseMs, LEASE_MS);
+        if (leaseMs <= sqlTimeoutMs) {
+            throw new IllegalArgumentException("--" + LEASE_MS + " must be > --" + SQL_TIMEOUT_MS);
+        }
     }
 
     private static void requirePositive(long value, String key) {
@@ -428,10 +456,15 @@ public class UzsAutoTransfer {
         }
         return "tableId=" + safe(task.tableId)
                 + ", src=" + safe(task.tableNamespace) + "." + safe(task.tableName)
-                + ", dst=" + safe(task.archiveTargetTableNamespace) + "." + safe(task.archiveTargetTableName)
+                + ", dst=" + safe(task.targetTableNamespace) + "." + safe(task.targetTableName)
                 + ", isPartitionTable=" + task.isPartitionTable
                 + ", partitionDesc=" + safe(task.partitionDesc)
-                + ", version=" + task.version;
+                + ", currentVersion=" + task.currentVersion
+                + ", requiredCompactionVersion=" + task.requiredCompactionVersion
+                + ", claimedBy=" + safe(task.claimedBy)
+                + ", claimAt=" + task.claimAt
+                + ", claimExpireAt=" + task.claimExpireAt
+                + ", claimToken=" + abbreviate(task.claimToken, 64);
     }
 
     private static String summarizePayload(Map<String, Object> payload) {
@@ -492,13 +525,6 @@ public class UzsAutoTransfer {
         return safe(value).replace("'", "''");
     }
 
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    private static class ApiResponse<T> {
-        public int code;
-        public String message;
-        public T data;
-    }
-
     private static class ProcessResult {
         private final boolean success;
         private final boolean retryable;
@@ -528,68 +554,136 @@ public class UzsAutoTransfer {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    private static class ApiErrorData {
-        public String code;
-        public String message;
-    }
-
-    @JsonIgnoreProperties(ignoreUnknown = true)
     private static class TransferTask {
         public String tableId;
+        public String partitionDesc;
+        @JsonAlias("version")
+        public Long currentVersion;
+        public Long requiredCompactionVersion;
         public String tableName;
         public String tableNamespace;
         public Boolean isPartitionTable;
-        public String partitionDesc;
-        public Long version;
-        public String archiveTargetTableName;
-        public String archiveTargetTableNamespace;
-        public String archiveSqlTemplate;
+        @JsonAlias("archiveTargetTableName")
+        public String targetTableName;
+        @JsonAlias("archiveTargetTableNamespace")
+        public String targetTableNamespace;
+        @JsonAlias("archiveSqlTemplate")
+        public String transferSqlTemplate;
+        public String claimedBy;
+        public String claimToken;
+        public Long claimAt;
+        public Long claimExpireAt;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class TransferClaimResult {
+        public Boolean claimed;
+        public String taskType;
+        public TransferTask task;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class TransferSubmitResult {
+        public Boolean updated;
+        public String action;
+        public String errorMessage;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class TableFactStatus {
+        public String tableId;
+        public String tableName;
+        public String tableNamespace;
+        public Boolean partitionTable;
+        public Boolean transferEnabled;
+        public String transferTargetTableName;
+        public String transferTargetTableNamespace;
+        public String transferSqlTemplate;
     }
 
     private static class TransferApiClient {
         private final String apiBaseUrl;
         private final String claimedBy;
+        private final long leaseMs;
         private final HttpClient client;
         private final long timeoutMs;
         private final AtomicLong callbackFailed;
 
-        private TransferApiClient(String apiBaseUrl, String claimedBy, HttpClient client, long timeoutMs, AtomicLong callbackFailed) {
+        private TransferApiClient(String apiBaseUrl, String claimedBy, long leaseMs, HttpClient client, long timeoutMs, AtomicLong callbackFailed) {
             this.apiBaseUrl = trimTrailingSlash(apiBaseUrl);
             this.claimedBy = claimedBy;
+            this.leaseMs = leaseMs;
             this.client = client;
             this.timeoutMs = timeoutMs;
             this.callbackFailed = callbackFailed;
         }
 
-        private TransferTask getTransferTask() throws IOException, InterruptedException {
-            String query = "claimedBy=" + URLEncoder.encode(claimedBy, StandardCharsets.UTF_8);
+        private TransferTask claimTransferTask() throws IOException, InterruptedException {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("workerId", claimedBy);
+            payload.put("leaseMs", leaseMs);
+            String requestBody = OBJECT_MAPPER.writeValueAsString(payload);
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(apiBaseUrl + "/getTransferTask?" + query))
+                    .uri(URI.create(apiBaseUrl + "/internal/tasks/transfer/claim"))
+                    .timeout(Duration.ofMillis(timeoutMs))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                    .build();
+            String body = sendRequest(request, summarizePayload(payload));
+            TransferClaimResult response = parseBody(body, new TypeReference<TransferClaimResult>() {
+            });
+            if (!Boolean.TRUE.equals(response.claimed) || response.task == null) {
+                LOG.info("claimTransferTask result: no task, claimed={}", response.claimed);
+                return null;
+            }
+            if (StringUtils.isNotBlank(response.taskType) && !"transfer".equalsIgnoreCase(response.taskType)) {
+                throw new IllegalArgumentException("unexpected taskType: " + response.taskType);
+            }
+            LOG.info("claimTransferTask result: {}", summarizeTask(response.task));
+            return response.task;
+        }
+
+        private void enrichTask(TransferTask task) throws IOException, InterruptedException {
+            TableFactStatus tableFact = getTableFact(task.tableId);
+            if (StringUtils.isNotBlank(tableFact.tableId) && !Objects.equals(task.tableId, tableFact.tableId)) {
+                throw new IllegalArgumentException("table fact mismatch, expected=" + task.tableId + ", actual=" + tableFact.tableId);
+            }
+            task.tableName = tableFact.tableName;
+            task.tableNamespace = tableFact.tableNamespace;
+            task.isPartitionTable = tableFact.partitionTable;
+            if (StringUtils.isBlank(task.targetTableName)) {
+                task.targetTableName = tableFact.transferTargetTableName;
+            }
+            if (StringUtils.isBlank(task.targetTableNamespace)) {
+                task.targetTableNamespace = tableFact.transferTargetTableNamespace;
+            }
+            if (StringUtils.isBlank(task.transferSqlTemplate)) {
+                task.transferSqlTemplate = tableFact.transferSqlTemplate;
+            }
+            if (Boolean.FALSE.equals(tableFact.transferEnabled)) {
+                throw new IllegalArgumentException("transfer disabled for tableId=" + task.tableId);
+            }
+        }
+
+        private TableFactStatus getTableFact(String tableId) throws IOException, InterruptedException {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(apiBaseUrl + "/internal/table/" + encodePathSegment(tableId)))
                     .timeout(Duration.ofMillis(timeoutMs))
                     .GET()
                     .build();
-            String body = sendRequest(request, "claimedBy=" + claimedBy);
-            ApiResponse<TransferTask> response = parseBody(body, new TypeReference<ApiResponse<TransferTask>>() {
+            String body = sendRequest(request, "tableId=" + tableId);
+            return parseBody(body, new TypeReference<TableFactStatus>() {
             });
-            if (response.code != 0) {
-                throw new ApiRequestException(-1, "getTransferTask failed: " + response.message);
-            }
-            if (response.data == null) {
-                LOG.info("getTransferTask result: no task, message={}", safe(response.message));
-            } else {
-                LOG.info("getTransferTask result: {}", summarizeTask(response.data));
-            }
-            return response.data;
         }
 
         private void setTaskDone(TransferTask task) throws IOException, InterruptedException {
             Map<String, Object> payload = buildCallbackPayload(task, null);
-            callSetTask("/setTaskDone", payload);
+            callSetTask("/internal/tasks/transfer/success", payload);
         }
 
         private void setTaskErr(TransferTask task, String errorMessage) throws IOException, InterruptedException {
             Map<String, Object> payload = buildCallbackPayload(task, errorMessage);
-            callSetTask("/setTaskErr", payload);
+            callSetTask("/internal/tasks/transfer/failure", payload);
         }
 
         private void callSetTask(String path, Map<String, Object> payload) throws IOException, InterruptedException {
@@ -602,14 +696,12 @@ public class UzsAutoTransfer {
                         .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                         .build();
                 String body = sendRequest(request, summarizePayload(payload));
-                ApiResponse<ApiErrorData> response = parseBody(body, new TypeReference<ApiResponse<ApiErrorData>>() {
+                TransferSubmitResult response = parseBody(body, new TypeReference<TransferSubmitResult>() {
                 });
-                if (response.code != 0) {
-                    String detailCode = response.data == null ? "" : safe(response.data.code);
-                    String detailMessage = response.data == null ? "" : safe(response.data.message);
-                    throw new ApiRequestException(-1, path + " failed: " + response.message
-                            + ", code=" + detailCode + ", detail=" + detailMessage);
+                if (!Boolean.TRUE.equals(response.updated)) {
+                    throw new ApiRequestException(409, path + " not updated: " + safe(response.errorMessage));
                 }
+                LOG.info("transfer callback accepted path={} action={}", path, safe(response.action));
             } catch (IOException | InterruptedException e) {
                 callbackFailed.incrementAndGet();
                 throw e;
@@ -618,10 +710,9 @@ public class UzsAutoTransfer {
 
         private Map<String, Object> buildCallbackPayload(TransferTask task, String errorMessage) {
             Map<String, Object> payload = new HashMap<>();
-            payload.put("claimType", CLAIM_TYPE);
             payload.put("tableId", task.tableId);
             payload.put("partitionDesc", task.partitionDesc);
-            payload.put("version", task.version);
+            payload.put("claimToken", task.claimToken);
             if (StringUtils.isNotBlank(errorMessage)) {
                 payload.put("errorMessage", errorMessage);
             }
@@ -663,5 +754,9 @@ public class UzsAutoTransfer {
             url = url.substring(0, url.length() - 1);
         }
         return url;
+    }
+
+    private static String encodePathSegment(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 }

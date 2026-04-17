@@ -1,136 +1,505 @@
-# uzs-lakesoul-archive
+# UZS Scheduler API
 
-## 当前职责
-- 仅维护 `table_archive_info`（tai）和 `partition_archive_status`（pas）
-- 不提交 Spark/Flink 作业；由外部 worker 拉取任务并回写结果
-- 启动后立即执行一次同步；之后按定时器或手动 `reload` 同步
+## 1. 基本说明
+- 基础地址：`http://{host}:{port}`
+- 当前无鉴权、无签名、无分页
+- 默认返回 `application/json`
+- 时间字段统一为毫秒时间戳
+- 当前实现接口均为内部接口，面向调度器、worker、运维脚本和下游工具
 
-## 配置项
-- `spring.datasource.*`：同库连接（LakeSoul 元数据 + 本服务业务表）
-- `archive.scheduler.auto-interval-ms`：定时同步间隔（默认 `300000`）
-- `archive.lock.sync-key`：同步阶段 `pg_try_advisory_lock` 锁键
-- `archive.task.lease-ms`：任务租约时长，默认 `1800000`（30 分钟）
+## 2. 通用状态码
+- `200`：请求成功
+- `400`：参数不合法
+- `404`：查询接口未找到目标对象
+- `409`：冲突，如 facts 已在运行、claimToken 不匹配或任务已释放
+- `500`：服务内部错误
+- `503`：数据库不可用，仅用于 `GET /internal/health/database`
 
-## 接口
+## 3. Health
 
-### 1) 触发同步
-```bash
-curl -X POST "http://127.0.0.1:8080/reload"
-```
+### `GET /internal/health/database`
+- 用途：检查数据库连通性
+- 响应字段：
+  - `available`：是否可用
+  - `ping`：探测耗时，毫秒
+  - `checkedAt`：检查时间
+  - `databaseTimeMillis`：数据库当前时间毫秒值
+  - `errorMessage`：失败时错误信息
 
-### 2) 领取 Spark 快照任务
-```bash
-curl "http://127.0.0.1:8080/getCompactionTask?claimedBy=spark-worker-1"
-```
+### `GET /actuator/health`
+- 用途：应用健康检查
+- 说明：Spring Boot Actuator 标准响应，包含自定义数据库健康项
 
-返回字段：`tableId/tableName/tableNamespace/isPartitionTable/partitionDesc/version`
+## 4. Facts
 
-### 3) 领取 Flink 转储任务
-```bash
-curl "http://127.0.0.1:8080/getTransferTask?claimedBy=flink-worker-1"
-```
+### `POST /internal/facts/refresh`
+- 用途：全量执行 facts 刷新
+- 参数：无
+- 返回：`FactsRefreshResult`
 
-返回字段：`tableId/tableName/tableNamespace/isPartitionTable/partitionDesc/version/archiveTargetTableName/archiveTargetTableNamespace/archiveSqlTemplate`
+### `POST /internal/facts/refresh/table`
+- 用途：按表刷新 facts
+- 参数：
+  - `tableId`：必填
+- 返回：`FactsRefreshResult`
 
-### 4) 任务完成回写
-```bash
-curl -X POST "http://127.0.0.1:8080/setTaskDone" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "claimType":"SPARK",
-    "tableId":"table_1",
-    "partitionDesc":"pt=2026-03-09",
-    "version":12
-  }'
-```
+### `POST /internal/facts/refresh/partition`
+- 用途：按分区刷新 facts
+- 参数：
+  - `tableId`：必填
+  - `partitionDesc`：必填
+- 返回：`FactsRefreshResult`
 
-### 5) 任务失败快速释放
-```bash
-curl -X POST "http://127.0.0.1:8080/setTaskErr" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "claimType":"FLINK",
-    "tableId":"table_1",
-    "partitionDesc":"pt=2026-03-09",
-    "version":12
-  }'
-```
+### `GET /internal/facts/status`
+- 用途：查询 facts 运行状态
+- 返回：`FactsRefreshStatus`
 
-## 统一响应结构
-- 统一 JSON：`{"code":<int>,"message":"<text>","data":<object|null>}`
-- 成功：`code=0`
-- 失败：`code` 为 HTTP 对应业务码（当前主要 `404/409/400`）
+### `FactsRefreshResult`
+- `outcome`：`SUCCESS | REJECTED_ALREADY_RUNNING | FAILED`
+- `trigger`：触发来源，如 `manual`、`scheduled`
+- `scope`：`all | table | partition`
+- `tableId`
+- `partitionDesc`
+- `startedAt`
+- `finishedAt`
+- `durationMs`
+- `checkpoints`：数组，元素字段：
+  - `checkpointName`
+  - `checkpointValue`
+- `errorMessage`
 
-## HTTP 状态与业务码映射
-- `200`：成功或幂等成功（`UPDATED`、`IDEMPOTENT`）
-- `404`：任务不存在（`NOT_FOUND`）
-- `409`：状态冲突（`VERSION_MISMATCH`、`CLAIM_MISMATCH`、`CLAIM_EXPIRED`、`INVALID_STATE`、`CONFLICT`）
-- `400`：请求体非法或未覆盖的业务分支
+### `FactsRefreshStatus`
+- `running`
+- `runningTrigger`
+- `runningScope`
+- `runningTableId`
+- `runningPartitionDesc`
+- `runningStartedAt`
+- `lastResult`：`FactsRefreshResult`
 
-## setTaskDone/setTaskErr 业务错误码
-- `UPDATED`：本次更新已生效
-- `IDEMPOTENT`：重复回调，已完成状态保持不变
-- `NOT_FOUND`：`tableId+partitionDesc` 不存在
-- `VERSION_MISMATCH`：回写版本不等于 `pas.version`
-- `CLAIM_MISMATCH`：任务未被该 `claimType` 领取
-- `CLAIM_EXPIRED`：租约过期（默认 30 分钟）
-- `INVALID_STATE`：非法状态（如分区已删除，或 Flink 回写前 Spark 未完成）
-- `CONFLICT`：并发竞争导致状态已变化
+## 5. Facts Query
 
-## 典型响应示例
+### `GET /internal/table/{tableId}`
+- 用途：查询表事实与平台控制配置
+- 路径参数：
+  - `tableId`
+- 返回：`TableFactStatus`
 
-### 领取到任务
-```json
-{
-  "code": 0,
-  "message": "OK",
-  "data": {
-    "tableId": "table_1",
-    "tableName": "dwd_order",
-    "tableNamespace": "lake_ns",
-    "isPartitionTable": true,
-    "partitionDesc": "pt=2026-03-09",
-    "version": 12,
-    "archiveTargetTableName": null,
-    "archiveTargetTableNamespace": null,
-    "archiveSqlTemplate": null
-  }
-}
-```
+### `GET /internal/partition`
+- 用途：查询分区事实
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+- 返回：`PartitionFactStatus`
 
-### 无任务可领
-```json
-{
-  "code": 0,
-  "message": "no task",
-  "data": null
-}
-```
+### `TableFactStatus`
+- `tableId`
+- `tableName`
+- `tableNamespace`
+- `deleted`
+- `partitionTable`
+- `compactionEnabled`
+- `compactionQuietPeriodMs`
+- `compactionMaxRetry`
+- `compactionBackoffMs`
+- `transferEnabled`
+- `transferTargetTableName`
+- `transferTargetTableNamespace`
+- `transferSqlTemplate`
+- `transferDelayMs`
+- `transferMaxRetry`
+- `transferBackoffMs`
+- `clearEnabled`
+- `clearDelayMs`
+- `clearMaxRetry`
+- `clearBackoffMs`
+- `clearMode`
+- `createTime`
+- `updateTime`
 
-### 回写成功
-```json
-{
-  "code": 0,
-  "message": "快照完成",
-  "data": null
-}
-```
+### `PartitionFactStatus`
+- `tableId`
+- `partitionDesc`
+- `currentVersion`
+- `lastCommitOp`
+- `lastPartitionTimestamp`
+- `lastSnapshot`：字符串数组
+- `deleted`
+- `discoveredAt`
+- `lastSeenAt`
+- `createTime`
+- `updateTime`
 
-### 回写冲突（示例：版本不匹配）
-```json
-{
-  "code": 409,
-  "message": "版本不匹配",
-  "data": {
-    "code": "VERSION_MISMATCH",
-    "message": "版本不匹配"
-  }
-}
-```
+## 6. Compaction
 
-## 回写约束
-- `setTaskDone/setTaskErr` 必须按 `table_id + partition_desc + version + claim_type` 精确匹配
-- 租约超时、版本不匹配、claim 类型不匹配时返回 `409`
-- `setTaskDone(SPARK)` 仅在 `compaction_done=false` 时置 `true` 并 `archive_count + 1`
-- `setTaskDone(FLINK)` 仅在 `compaction_done=true` 且 `transfer_done=false` 时置 `transfer_done=true`
-- `setTaskErr` 仅释放 claim（清空 `claim_*`），用于立即重派发
+### `POST /internal/tasks/compaction/refresh`
+- 用途：全量刷新 compaction 当前任务表
+- 参数：无
+- 返回：`CompactionRefreshResult`
+
+### `POST /internal/tasks/compaction/refresh/table`
+- 参数：
+  - `tableId`
+- 返回：`CompactionRefreshResult`
+
+### `POST /internal/tasks/compaction/refresh/partition`
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+- 返回：`CompactionRefreshResult`
+
+### `GET /internal/tasks/compaction`
+- 用途：查询指定分区当前 compaction 任务
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+- 返回：`CompactionTaskStatus`
+
+### `POST /internal/tasks/compaction/claim`
+- 用途：领取一个 compaction 任务
+- 参数：
+  - `workerId`
+  - `leaseMs`
+- 返回：`CompactionClaimResult`
+
+### `POST /internal/tasks/compaction/success`
+- 用途：提交 compaction 成功
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+  - `claimToken`
+- 返回：`CompactionSubmitResult`
+
+### `POST /internal/tasks/compaction/failure`
+- 用途：提交 compaction 失败
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+  - `claimToken`
+  - `errorMessage`
+- 返回：`CompactionSubmitResult`
+
+### `POST /internal/tasks/compaction/recover-expired-claims`
+- 用途：回收过期 claim
+- 参数：无
+- 返回：`CompactionRecoverResult`
+
+### `CompactionRefreshResult`
+- `trigger`
+- `scope`
+- `tableId`
+- `partitionDesc`
+- `refreshedAt`
+
+### `CompactionTaskStatus`
+- `tableId`
+- `partitionDesc`
+- `currentVersion`
+- `runVersion`
+- `lastSuccessVersion`
+- `versionChangedAt`
+- `hasVersionChangeDuringRun`
+- `deleted`
+- `taskStatus`
+- `discoveredAt`
+- `readyAt`
+- `claimedBy`
+- `claimToken`
+- `claimAt`
+- `claimExpireAt`
+- `retryCount`
+- `nextRetryAt`
+- `lastError`
+- `execCount`
+- `startExecAt`
+- `finishAt`
+- `lastCompactionTime`
+- `createTime`
+- `updateTime`
+
+### `CompactionClaimResult`
+- `claimed`
+- `taskType`：固定为 `compaction`
+- `task`：为空表示当前无任务；有值时字段：
+  - `tableId`
+  - `partitionDesc`
+  - `currentVersion`
+  - `runVersion`
+  - `claimedBy`
+  - `claimToken`
+  - `claimAt`
+  - `claimExpireAt`
+
+### `CompactionSubmitResult`
+- `updated`
+- `action`：`success | failure`
+- `tableId`
+- `partitionDesc`
+- `currentVersion`
+- `lastSuccessVersion`
+- `retryCount`
+- `nextRetryAt`
+- `taskStatus`
+- `errorMessage`
+
+### `CompactionRecoverResult`
+- `recoveredCount`
+- `tasks`：数组，元素字段：
+  - `tableId`
+  - `partitionDesc`
+  - `taskStatus`
+
+## 7. Transfer
+
+### `POST /internal/tasks/transfer/refresh`
+- 用途：全量刷新 transfer 当前任务表
+- 参数：无
+- 返回：`TransferRefreshResult`
+
+### `POST /internal/tasks/transfer/refresh/table`
+- 参数：
+  - `tableId`
+- 返回：`TransferRefreshResult`
+
+### `POST /internal/tasks/transfer/refresh/partition`
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+- 返回：`TransferRefreshResult`
+
+### `GET /internal/tasks/transfer`
+- 用途：查询指定分区当前 transfer 任务
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+- 返回：`TransferTaskStatus`
+
+### `POST /internal/tasks/transfer/claim`
+- 参数：
+  - `workerId`
+  - `leaseMs`
+- 返回：`TransferClaimResult`
+
+### `POST /internal/tasks/transfer/success`
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+  - `claimToken`
+- 返回：`TransferSubmitResult`
+
+### `POST /internal/tasks/transfer/failure`
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+  - `claimToken`
+  - `errorMessage`
+- 返回：`TransferSubmitResult`
+
+### `POST /internal/tasks/transfer/recover-expired-claims`
+- 参数：无
+- 返回：`TransferRecoverResult`
+
+### `TransferRefreshResult`
+- `trigger`
+- `scope`
+- `tableId`
+- `partitionDesc`
+- `refreshedAt`
+
+### `TransferTaskStatus`
+- `tableId`
+- `partitionDesc`
+- `currentVersion`
+- `requiredCompactionVersion`
+- `lastSuccessVersion`
+- `deleted`
+- `taskStatus`
+- `targetTableName`
+- `targetTableNamespace`
+- `transferSqlTemplate`
+- `discoveredAt`
+- `readyAt`
+- `claimedBy`
+- `claimToken`
+- `claimAt`
+- `claimExpireAt`
+- `retryCount`
+- `nextRetryAt`
+- `lastError`
+- `execCount`
+- `startExecAt`
+- `finishAt`
+- `lastTransferTime`
+- `createTime`
+- `updateTime`
+
+### `TransferClaimResult`
+- `claimed`
+- `taskType`：固定为 `transfer`
+- `task`：为空表示当前无任务；有值时字段：
+  - `tableId`
+  - `partitionDesc`
+  - `currentVersion`
+  - `requiredCompactionVersion`
+  - `targetTableName`
+  - `targetTableNamespace`
+  - `transferSqlTemplate`
+  - `claimedBy`
+  - `claimToken`
+  - `claimAt`
+  - `claimExpireAt`
+
+### `TransferSubmitResult`
+- `updated`
+- `action`
+- `tableId`
+- `partitionDesc`
+- `currentVersion`
+- `lastSuccessVersion`
+- `retryCount`
+- `nextRetryAt`
+- `taskStatus`
+- `errorMessage`
+
+### `TransferRecoverResult`
+- `recoveredCount`
+- `tasks`：数组，元素字段：
+  - `tableId`
+  - `partitionDesc`
+  - `taskStatus`
+
+## 8. Clear
+
+### `POST /internal/tasks/clear/refresh`
+- 用途：全量刷新 clear 当前任务表
+- 参数：无
+- 返回：`ClearRefreshResult`
+
+### `POST /internal/tasks/clear/refresh/table`
+- 参数：
+  - `tableId`
+- 返回：`ClearRefreshResult`
+
+### `POST /internal/tasks/clear/refresh/partition`
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+- 返回：`ClearRefreshResult`
+
+### `GET /internal/tasks/clear`
+- 用途：查询指定分区当前 clear 任务
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+- 返回：`ClearTaskStatus`
+
+### `POST /internal/tasks/clear/claim`
+- 参数：
+  - `workerId`
+  - `leaseMs`
+- 返回：`ClearClaimResult`
+
+### `POST /internal/tasks/clear/success`
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+  - `claimToken`
+  - `clearedFileCount`：可选，默认 `0`
+  - `clearedCommitCount`：可选，默认 `0`
+  - `clearedVersionCount`：可选，默认 `0`
+- 返回：`ClearSubmitResult`
+
+### `POST /internal/tasks/clear/failure`
+- 参数：
+  - `tableId`
+  - `partitionDesc`
+  - `claimToken`
+  - `errorMessage`
+- 返回：`ClearSubmitResult`
+
+### `POST /internal/tasks/clear/recover-expired-claims`
+- 参数：无
+- 返回：`ClearRecoverResult`
+
+### `ClearRefreshResult`
+- `trigger`
+- `scope`
+- `tableId`
+- `partitionDesc`
+- `refreshedAt`
+
+### `ClearTaskStatus`
+- `tableId`
+- `partitionDesc`
+- `startVersion`
+- `endVersion`
+- `endCommitOp`
+- `endPartitionTimestamp`
+- `endSnapshot`：字符串数组
+- `versionCount`
+- `clearDone`
+- `requiredCompactionVersion`
+- `deleted`
+- `taskStatus`
+- `discoveredAt`
+- `readyAt`
+- `claimedBy`
+- `claimToken`
+- `claimAt`
+- `claimExpireAt`
+- `retryCount`
+- `nextRetryAt`
+- `lastError`
+- `execCount`
+- `startExecAt`
+- `finishAt`
+- `clearedFileCount`
+- `clearedCommitCount`
+- `clearedVersionCount`
+- `lastClearTime`
+- `createTime`
+- `updateTime`
+
+### `ClearClaimResult`
+- `claimed`
+- `taskType`：固定为 `clear`
+- `task`：为空表示当前无任务；有值时字段：
+  - `tableId`
+  - `partitionDesc`
+  - `startVersion`
+  - `endVersion`
+  - `endCommitOp`
+  - `endPartitionTimestamp`
+  - `endSnapshot`：字符串数组
+  - `versionCount`
+  - `requiredCompactionVersion`
+  - `claimedBy`
+  - `claimToken`
+  - `claimAt`
+  - `claimExpireAt`
+
+### `ClearSubmitResult`
+- `updated`
+- `action`
+- `tableId`
+- `partitionDesc`
+- `startVersion`
+- `endVersion`
+- `retryCount`
+- `nextRetryAt`
+- `clearDone`
+- `taskStatus`
+- `errorMessage`
+
+### `ClearRecoverResult`
+- `recoveredCount`
+- `tasks`：数组，元素字段：
+  - `tableId`
+  - `partitionDesc`
+  - `taskStatus`
+
+## 9. 调用建议
+- 手工或系统入口统一从 `facts refresh` 开始，自动链路为：`facts -> compaction -> transfer -> clear`
+- worker 提交成功/失败时必须带原始 `claimToken`
+- 对 `GET /internal/tasks/*` 建议在 worker 执行前做一次读取，用于排障与状态确认
+- `clear` 只有在仍存在历史版本时才会进入 `ready/claim`
