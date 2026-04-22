@@ -30,6 +30,7 @@ SPDX-License-Identifier: Apache-2.0
         <local.scope>provided</local.scope>
         <test.fork.count>2</test.fork.count>
         <spark.shade.skip>false</spark.shade.skip>
+		<maven.build.timestamp.format>yyyyMMdd-HHmmss</maven.build.timestamp.format>
     </properties>
 
     <repositories>
@@ -458,6 +459,7 @@ SPDX-License-Identifier: Apache-2.0
     </profiles>
 
     <build>
+		<finalName>${project.artifactId}-${project.version}-${maven.build.timestamp}</finalName>
         <plugins>
             <plugin>
                 <groupId>net.alchim31.maven</groupId>

@@ -894,16 +894,7 @@
   "endVersion": 17,
   "endCommitOp": "CompactionCommit",
   "endPartitionTimestamp": 1776412500000,
-  "endSnapshot": [
-    "8e1827c1-0d73-47e8-85f7-2fcadcb2c41e",
-    "3f67b4d9-9d68-4d1e-92de-2a39f8bc1011"
-  ],
-  "commitIdList": [
-    "8e1827c1-0d73-47e8-85f7-2fcadcb2c41e",
-    "3f67b4d9-9d68-4d1e-92de-2a39f8bc1011",
-    "0f0db1f2-7717-4d0d-a7da-3db6e3ca2024"
-  ],
-  "versionCount": 3,
+$$  "versionCount": 3,
   "clearDone": false,
   "requiredCompactionVersion": 18,
   "deleted": false,
@@ -954,15 +945,6 @@
     "endVersion": 17,
     "endCommitOp": "CompactionCommit",
     "endPartitionTimestamp": 1776412500000,
-    "endSnapshot": [
-      "8e1827c1-0d73-47e8-85f7-2fcadcb2c41e",
-      "3f67b4d9-9d68-4d1e-92de-2a39f8bc1011"
-    ],
-    "commitIdList": [
-      "8e1827c1-0d73-47e8-85f7-2fcadcb2c41e",
-      "3f67b4d9-9d68-4d1e-92de-2a39f8bc1011",
-      "0f0db1f2-7717-4d0d-a7da-3db6e3ca2024"
-    ],
     "versionCount": 3,
     "requiredCompactionVersion": 18,
     "claimedBy": "worker-03",
@@ -1109,7 +1091,7 @@
 ### 10.4 任务状态字段
 - `tableName / tableNamespace / isPartitionTable`：任务源表上下文；worker 仅调用 `claim` 即可拿到执行所需表级信息。
 - `targetPartitionDesc`：仅 `transfer` 任务返回，当前与源 `partitionDesc` 保持一致，表示目标表对应分区。
-- `commitIdList`：仅 `clear` 任务返回，表示基于当前 `startVersion ~ endVersion` 范围展开得到的待清理 commit 标识列表。
+- `startVersion / endVersion`：`clear` 任务只返回待清理版本区间；worker 需据此自行查询 LakeSoul 元数据获取 snapshot、commit 和文件列表。
 - `taskStatus` 当前常见值：
   - `ready`：可被 worker 领取
   - `running`：已被 worker 领取且尚未提交结果
