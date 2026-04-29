@@ -5,6 +5,7 @@
 package com.dmetasoul.lakesoul.lakesoul.io;
 
 import com.dmetasoul.lakesoul.lakesoul.LakeSoulArrowUtils;
+import com.dmetasoul.lakesoul.lakesoul.io.jnr.LibLakeSoulIO;
 import com.dmetasoul.lakesoul.meta.DBConfig;
 import com.dmetasoul.lakesoul.meta.DBUtil;
 import com.dmetasoul.lakesoul.meta.entity.TableInfo;
@@ -19,6 +20,8 @@ import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -29,6 +32,8 @@ import java.util.stream.Collectors;
 import static com.dmetasoul.lakesoul.meta.DBConfig.TableInfoProperty.HASH_BUCKET_NUM;
 
 public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
+
+    private final static Logger LOG = LoggerFactory.getLogger(NativeIOWriter.class);
 
     private Pointer writer = null;
 
@@ -91,42 +96,28 @@ public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
         assert ioConfigBuilder != null;
 
         tokioRuntime = libLakeSoulIO.create_tokio_runtime_from_builder(tokioRuntimeBuilder);
+        tokioRuntimeBuilder = null;
         config = libLakeSoulIO.create_lakesoul_io_config_from_builder(ioConfigBuilder);
+        ioConfigBuilder = null;
         writer = libLakeSoulIO.create_lakesoul_writer_from_config(config, tokioRuntime);
-        // tokioRuntime will be moved to writer, we don't need to free it
+        config = null;
         tokioRuntime = null;
         Pointer p = libLakeSoulIO.check_writer_created(writer);
         if (p != null) {
             writer = null;
-            throw new IOException("Init native writer failed with error: " + p.getString(0));
+            String err = p.getString(0);
+            libLakeSoulIO.free_lakesoul_writer(writer);
+            throw new IOException("Init native writer failed with error: " + err);
         }
     }
 
     public int writeIpc(byte[] encodedBatch) throws IOException {
-//        Pointer ipc = getRuntime().getMemoryManager().allocateDirect(encodedBatch.length + 1, true);
-//        ipc.put(0, encodedBatch, 0, encodedBatch.length);
-//        ipc.putByte(encodedBatch.length, (byte) 0);
-//        String msg = libLakeSoulIO.write_record_batch_ipc_blocked(writer, ipc.address(), ipc.size());
-//        if (!msg.startsWith("Ok: ")) {
-//            throw new IOException("Native writer write batch failed with error: " + msg);
-//        }
-//
-//        return Integer.parseInt(msg.substring(4));
-
         int batchSize = 0;
         try (ArrowStreamReader reader = new ArrowStreamReader(new ByteArrayInputStream(encodedBatch), allocator)) {
             if (reader.loadNextBatch()) {
-                ArrowArray array = ArrowArray.allocateNew(allocator);
-                ArrowSchema schema = ArrowSchema.allocateNew(allocator);
                 VectorSchemaRoot batch = reader.getVectorSchemaRoot();
                 batchSize = batch.getRowCount();
-                Data.exportVectorSchemaRoot(allocator, batch, provider, array, schema);
-                String errMsg = libLakeSoulIO.write_record_batch_blocked(writer, schema.memoryAddress(), array.memoryAddress());
-                array.close();
-                schema.close();
-                if (errMsg != null && !errMsg.isEmpty()) {
-                    throw new IOException("Native writer write batch failed with error: " + errMsg);
-                }
+                this.write(batch);
             }
         }
         return batchSize;
@@ -136,11 +127,16 @@ public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
         ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator);
         Data.exportVectorSchemaRoot(allocator, batch, provider, array, schema);
-        String errMsg = libLakeSoulIO.write_record_batch_blocked(writer, schema.memoryAddress(), array.memoryAddress());
-        array.close();
-        schema.close();
-        if (errMsg != null && !errMsg.isEmpty()) {
-            throw new IOException("Native writer write batch failed with error: " + errMsg);
+        LibLakeSoulIO.CStatus status = libLakeSoulIO.write_record_batch_blocked(writer, schema.memoryAddress(), array.memoryAddress());
+        try {
+            if (status.status.get() < 0) {
+                throw new IOException("Native writer write batch failed with error: " +
+                        (status.err.get() != null ? status.err.get() : "unknown"));
+            }
+        } finally {
+            array.close();
+            schema.close();
+            libLakeSoulIO.free_c_status(status);
         }
     }
 
@@ -199,6 +195,7 @@ public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
         Pointer ptrResult = libLakeSoulIO.flush_and_close_writer(writer, nativeIntegerCallback);
         writer = null;
         if (errMsg.get() != null && !errMsg.get().isEmpty()) {
+            libLakeSoulIO.free_bytes_result(ptrResult);
             throw new IOException("Native writer flush failed with error: " + errMsg.get());
         }
 
@@ -221,7 +218,7 @@ public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
             }, boolReferenceManager);
             nativeBooleanCallback.registerReferenceKey();
             libLakeSoulIO.export_bytes_result(nativeBooleanCallback, ptrResult, len, buffer.address());
-
+            ptrResult = null;
             if (exported.get() != null && exported.get()) {
                 byte[] bytes = new byte[len];
                 buffer.get(0, bytes, 0, len);
@@ -246,6 +243,10 @@ public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
     }
 
     public void abort() throws IOException {
+        if (writer == null) {
+            return;
+        }
+        LOG.info("NativeIOWriter start abort");
         AtomicReference<String> errMsg = new AtomicReference<>();
         BooleanCallback nativeBooleanCallback = new BooleanCallback((status, err) -> {
             if (!status && err != null) {
@@ -262,9 +263,29 @@ public class NativeIOWriter extends NativeIOBase implements AutoCloseable {
 
     @Override
     public void close() throws Exception {
-        if (writer != null) {
+        LOG.info("NativeIOWriter start close");
+        Throwable firstException = null;
+        try {
             abort();
+        } catch (Throwable t) {
+            firstException = t;
+        } finally {
+            try {
+                super.close();
+            } catch (Throwable t) {
+                if (firstException == null) {
+                    firstException = t;
+                } else {
+                    firstException.addSuppressed(t);
+                }
+            }
         }
-        super.close();
+        if (firstException != null) {
+            if (firstException instanceof Error) {
+                throw (Error) firstException;
+            } else {
+                throw (Exception) firstException;
+            }
+        }
     }
 }

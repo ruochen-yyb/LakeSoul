@@ -127,6 +127,8 @@ SPDX-License-Identifier: Apache-2.0
         <local.scope>provided</local.scope>
         <protobuf.plugin.version>0.6.1</protobuf.plugin.version>
         <protoc.version>3.5.1</protoc.version>
+        <scala.binary.version>2.12</scala.binary.version>
+        <scala.version>2.12.15</scala.version>
     </properties>
 
     <dependencies>
@@ -191,7 +193,7 @@ SPDX-License-Identifier: Apache-2.0
         <dependency>
             <groupId>com.github.jnr</groupId>
             <artifactId>jnr-ffi</artifactId>
-            <version>2.2.16</version>
+            <version>2.2.19</version>
         </dependency>
         <dependency>
             <groupId>org.apache.hadoop</groupId>

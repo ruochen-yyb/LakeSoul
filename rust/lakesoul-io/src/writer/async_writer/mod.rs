@@ -30,14 +30,17 @@ use arrow_schema::SchemaRef;
 use atomic_refcell::AtomicRefCell;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties, stream::RecordBatchReceiverStreamBuilder,
 };
+use datafusion_physical_plan::{
+    execution_plan::{Boundedness, EmissionType},
+    metrics::MetricsSet,
+};
 use parquet::file::metadata::ParquetMetaData;
 
-use crate::Result;
+use crate::{Result, session::LakeSoulIOSession};
 
 #[derive(Debug, Clone)]
 pub struct FlushOutput {
@@ -51,10 +54,26 @@ pub struct FlushOutput {
 #[async_trait::async_trait]
 pub trait AsyncBatchWriter {
     /// Write a record batch to the writer.
+    /// When error occured, writer will clean the resource.
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<()>;
 
     /// Flush the writer and close it.
     async fn flush_and_close(self: Box<Self>) -> Result<Vec<FlushOutput>>;
+
+    /// Flush the writer, this can only be called once.
+    async fn flush(&mut self) -> Result<Vec<FlushOutput>> {
+        unimplemented!()
+    }
+
+    /// Close the writer
+    async fn close(self: Box<Self>) -> Result<()> {
+        unimplemented!()
+    }
+
+    /// Abort the writer
+    async fn abort(&mut self) -> Result<()> {
+        unimplemented!()
+    }
 
     /// Abort the writer and close it when an error occurs.
     async fn abort_and_close(self: Box<Self>) -> Result<()>;
@@ -65,6 +84,16 @@ pub trait AsyncBatchWriter {
     /// Get the buffered size of rows in the writer.
     fn buffered_size(&self) -> u64 {
         0
+    }
+
+    /// Get the LakeSoul io session of this writer.
+    fn io_session(&self) -> &Arc<LakeSoulIOSession> {
+        unimplemented!()
+    }
+
+    /// Get the metrics of this writer.
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
     }
 }
 

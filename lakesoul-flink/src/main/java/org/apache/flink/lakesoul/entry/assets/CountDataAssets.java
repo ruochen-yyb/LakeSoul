@@ -68,14 +68,15 @@ public class CountDataAssets {
         StartupOptions startupOptions = StartupOptions.initial();
         if (startMode.equals("latest")) {
             startupOptions = StartupOptions.latest();
-        } else if (startMode.equals("earliest")) {
-            startupOptions = StartupOptions.earliest();
+        } else if (startMode.equals("earliest") || startMode.equals("initial")) {
+            startupOptions = StartupOptions.initial();
         }
         PgDeserialization deserialization = new PgDeserialization();
         Properties debeziumProperties = new Properties();
         debeziumProperties.setProperty("include.unknown.datatypes", "true");
         debeziumProperties.setProperty("event.deserialization.failure.handling.mode", "warn");
         debeziumProperties.setProperty("schema.history.internal.store.only.captured.tables.ddl", "true");
+        debeziumProperties.setProperty("heartbeat.interval.ms", "10000");
         String[] tableList = new String[]{"public.data_commit_info"};
         JdbcIncrementalSource<String> postgresIncrementalSource =
                 PostgresSourceBuilder.PostgresIncrementalSource.<String>builder()

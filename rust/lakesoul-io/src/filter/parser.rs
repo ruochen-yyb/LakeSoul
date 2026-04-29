@@ -49,7 +49,7 @@ pub enum FilterContainer {
 
 impl Parser {
     pub fn parse(filter_str: String, schema: SchemaRef) -> Result<Expr> {
-        debug!(filter_str=%filter_str);
+        info!("parsing filter str {}", filter_str);
         let (op, left, right) = Parser::parse_filter_str(filter_str)?;
         let expr = if op.eq("or") {
             let left_expr = Parser::parse(left, schema.clone())?;
@@ -106,11 +106,7 @@ impl Parser {
             match ch {
                 '(' => k += 1,
                 ')' => k -= 1,
-                ',' => {
-                    if k == 0 && left_offset == 0 {
-                        left_offset = offset_counter
-                    }
-                }
+                ',' if k == 0 && left_offset == 0 => left_offset = offset_counter,
                 _ => {}
             }
             offset_counter += ch.len_utf8()
@@ -373,8 +369,7 @@ impl Parser {
         match container {
             FilterContainer::RawBuf(buf) => {
                 let c = parse_buf(&buf)?;
-                return Box::pin(Parser::parse_filter_container(context, schema, c))
-                    .await;
+                Box::pin(Parser::parse_filter_container(context, schema, c)).await
             }
             FilterContainer::String(s) => {
                 let arrow_schema = Arc::new(schema.as_arrow().clone());

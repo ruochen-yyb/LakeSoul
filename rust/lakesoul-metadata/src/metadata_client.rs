@@ -47,10 +47,10 @@ impl Debug for MetaDataClient {
 
 pub type MetaDataClientRef = Arc<MetaDataClient>;
 
-pub const PRIMARY_URL_PROP_KEY: &'static str = "lakesoul.pg.url=";
-pub const PRIMARY_URL_ENV_KEY: &'static str = "LAKESOUL_PG_URL";
-pub const SECONDARY_URL_PROP_KEY: &'static str = "lakesoul.pg.secondary.url=";
-pub const SECONDARY_URL_ENV_KEY: &'static str = "LAKESOUL_PG_SECONDARY_URL";
+pub const PRIMARY_URL_PROP_KEY: &str = "lakesoul.pg.url=";
+pub const PRIMARY_URL_ENV_KEY: &str = "LAKESOUL_PG_URL";
+pub const SECONDARY_URL_PROP_KEY: &str = "lakesoul.pg.secondary.url=";
+pub const SECONDARY_URL_ENV_KEY: &str = "LAKESOUL_PG_SECONDARY_URL";
 
 /// Generate pg config from environment variable
 pub fn pg_config_from_env(
@@ -122,10 +122,16 @@ pub fn pg_config_from_env(
                 .unwrap_or_else(|_| "lakesoul_test".to_string())
         ));
     }
-    // use default
-    let default_config = "host=127.0.0.1 port=5432 dbname=lakesoul_test user=lakesoul_test password=lakesoul_test";
-    trace!("get config by default {}", default_config);
-    Ok(default_config.to_string())
+    if url_env == SECONDARY_URL_ENV_KEY {
+        Err(LakeSoulMetaDataError::NotFound(
+            "Secondary url not found".to_string(),
+        ))
+    } else {
+        // use default
+        let default_config = "host=127.0.0.1 port=5432 dbname=lakesoul_test user=lakesoul_test password=lakesoul_test";
+        trace!("get config by default {}", default_config);
+        Ok(default_config.to_string())
+    }
 }
 
 impl MetaDataClient {

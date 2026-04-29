@@ -43,6 +43,7 @@ public class NativeParquetWriter implements InProgressFileWriter<RowData, String
     private NativeIOWriter nativeWriter;
     private final Configuration conf;
     private final int maxRowGroupRows;
+    private final int batchSize;
 
     private final long creationTime;
 
@@ -71,6 +72,7 @@ public class NativeParquetWriter implements InProgressFileWriter<RowData, String
         this.creationTime = creationTime;
         this.bucketID = bucketID;
         this.isDynamicBucket = DYNAMIC_BUCKET.equals(bucketID);
+        this.batchSize = conf.get(BATCH_SIZE);
         this.rowsInBatch = 0;
         this.rowType = rowType;
         this.primaryKeys = primaryKeys;
@@ -92,13 +94,7 @@ public class NativeParquetWriter implements InProgressFileWriter<RowData, String
         Schema arrowSchema = ArrowUtils.toArrowSchema(rowType);
         nativeWriter = new NativeIOWriter(arrowSchema);
         nativeWriter.setPrimaryKeys(primaryKeys);
-        if (!primaryKeys.isEmpty()) {
-            nativeWriter.setOption(STABLE_SORT, "true");
-        }
 
-        if (conf.getBoolean(LakeSoulSinkOptions.isMultiTableSource)) {
-            nativeWriter.setAuxSortColumns(Collections.singletonList(SORT_FIELD));
-        }
         nativeWriter.setHashBucketNum(conf.getInteger(LakeSoulSinkOptions.HASH_BUCKET_NUM));
 
         nativeWriter.setRowGroupRowNumber(this.maxRowGroupRows);
@@ -113,6 +109,9 @@ public class NativeParquetWriter implements InProgressFileWriter<RowData, String
         }
 
         FlinkUtil.setIOConfigs(conf, nativeWriter);
+        if (!primaryKeys.isEmpty()) {
+            nativeWriter.setOption(STABLE_SORT, "true");
+        }
         nativeWriter.initializeWriter();
         LOG.info("Initialized NativeParquetWriter: {}", this);
     }
@@ -123,7 +122,7 @@ public class NativeParquetWriter implements InProgressFileWriter<RowData, String
         this.arrowWriter.write(element);
         this.rowsInBatch++;
         this.totalRows++;
-        if (this.rowsInBatch >= this.maxRowGroupRows) {
+        if (this.rowsInBatch >= this.batchSize) {
             this.arrowWriter.finish();
             this.nativeWriter.write(this.batch);
             // in native writer, batch may be kept in memory for sorting,
@@ -260,15 +259,46 @@ public class NativeParquetWriter implements InProgressFileWriter<RowData, String
 
     @Override
     public void dispose() {
-        try {
-            this.arrowWriter.finish();
-            this.batch.close();
-            this.nativeWriter.close();
-            this.nativeWriter = null;
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+        LOG.info("Disposing NativeParquetWriter...");
+        Throwable firstException = null;
+
+        if (this.arrowWriter != null) {
+            try {
+                this.arrowWriter.finish();
+            } catch (Throwable t) {
+                LOG.warn("Error finishing arrow writer, memory will still be cleared", t);
+                firstException = t;
+            }
+        }
+
+        if (this.batch != null) {
+            try {
+                this.batch.close();
+            } catch (Throwable t) {
+                LOG.warn("Error closing arrow batch", t);
+                if (firstException == null) firstException = t;
+            }
+        }
+
+        if (this.nativeWriter != null) {
+            try {
+                this.nativeWriter.close();
+            } catch (Throwable t) {
+                LOG.error("CRITICAL: Error closing native writer, native memory leak potential!", t);
+                if (firstException == null) firstException = t;
+            } finally {
+                this.nativeWriter = null;
+            }
+        }
+
+        if (firstException != null) {
+            if (firstException instanceof RuntimeException) {
+                throw (RuntimeException) firstException;
+            }
+            throw new RuntimeException("Error during writer disposal", firstException);
         }
     }
+
 
     @Override
     public String getBucketId() {

@@ -47,7 +47,7 @@ async fn create_pool(config: &str) -> Result<Pool<PgConnectionManager>> {
     let config = config.parse::<Config>()?;
     let manager = PgConnectionManager::new(config);
     let pool = Pool::builder()
-        .max_size(8)
+        .max_size(16)
         .min_idle(1)
         .connection_timeout(Duration::from_secs(10))
         .idle_timeout(Some(Duration::from_secs(30)))
@@ -63,10 +63,6 @@ impl PooledClient {
         config: String,
         secondary_config: Option<String>,
     ) -> Result<PooledClient> {
-        info!(
-            "try to create pooled client with config {}, secondary {:?}",
-            &config, &secondary_config
-        );
         let pool = create_pool(&config).await?;
         let secondary_pool = if let Some(sec_conf) = secondary_config {
             Some(create_pool(&sec_conf).await?)

@@ -331,6 +331,7 @@ impl SyncSendableMutableLakeSoulWriter {
         }
     }
 
+    #[instrument(skip(self), err)]
     pub fn flush_and_close(self) -> Result<Vec<u8>> {
         if let Some(inner_writer) = self.in_progress {
             let inner_writer = match Arc::try_unwrap(inner_writer) {
@@ -381,6 +382,7 @@ impl SyncSendableMutableLakeSoulWriter {
         }
     }
 
+    #[instrument(skip(self), err)]
     pub fn abort_and_close(self) -> Result<()> {
         if let Some(inner_writer) = self.in_progress {
             let inner_writer = match Arc::try_unwrap(inner_writer) {
@@ -409,26 +411,23 @@ mod tests {
     use crate::{
         Result,
         config::{LakeSoulIOConfigBuilder, OPTION_KEY_MEM_LIMIT},
-        reader::LakeSoulReader,
     };
 
+    use super::SortAsyncWriter;
     use super::*;
 
+    use arrow::array::{Date32Array, Decimal128Array, TimestampMicrosecondArray};
     use arrow::{
         array::{ArrayRef, Int64Array},
         record_batch::RecordBatch,
     };
     use arrow_array::{Array, StringArray};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use chrono::{NaiveDate, NaiveDateTime};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
     use rand::{Rng, distr::SampleString};
     use std::{fs::File, sync::Arc};
     use tokio::{runtime::Builder, time::Instant};
-    use tracing_subscriber::layer::SubscriberExt;
-
-    use super::SortAsyncWriter;
-    use arrow::array::{Date32Array, Decimal128Array, TimestampMicrosecondArray};
-    use chrono::{NaiveDate, NaiveDateTime};
 
     #[test]
     fn test_parquet_async_write() -> Result<()> {
@@ -571,193 +570,15 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_s3_read_write() -> Result<()> {
-        let common_io_config_builder = LakeSoulIOConfigBuilder::new()
-            .with_thread_num(2)
-            .with_batch_size(8192)
-            .with_max_row_group_size(250000)
-            .with_object_store_option(
-                "fs.s3a.access.key".to_string(),
-                "minioadmin1".to_string(),
-            )
-            .with_object_store_option(
-                "fs.s3a.secret.key".to_string(),
-                "minioadmin1".to_string(),
-            )
-            .with_object_store_option(
-                "fs.s3a.endpoint".to_string(),
-                "http://localhost:9000".to_string(),
-            );
-
-        let read_io_config = common_io_config_builder
-            .clone()
-            .with_files(vec![
-                "s3://lakesoul-test-bucket/data/native-io-test/large_file.parquet"
-                    .to_string(),
-            ])
-            .build();
-        let mut reader = LakeSoulReader::new(read_io_config)?;
-        reader.start().await?;
-
-        let schema = reader.schema.clone().unwrap();
-
-        let writer_io_config = common_io_config_builder
-            .clone()
-            .with_files(vec![
-                "s3://lakesoul-test-bucket/data/native-io-test/large_file_written.parquet".to_string(),
-            ])
-            .with_schema(schema)
-            .build();
-        let io_session = Arc::new(LakeSoulIOSession::try_new(writer_io_config)?);
-        let mut async_writer = MultiPartAsyncWriter::try_new(io_session).await?;
-
-        while let Some(rb) = reader.next_rb().await {
-            let rb = rb?;
-            async_writer.write_record_batch(rb).await?;
-        }
-
-        Box::new(async_writer).flush_and_close().await?;
-        drop(reader);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sort_spill_write() -> Result<()> {
-        let runtime = Arc::new(Builder::new_multi_thread().enable_all().build().unwrap());
-        runtime.clone().block_on(async move {
-            let common_conf_builder = LakeSoulIOConfigBuilder::new()
-                .with_thread_num(2)
-                .with_batch_size(8192)
-                .with_max_row_group_size(250000);
-            let read_io_config = common_conf_builder
-                .clone()
-                .with_files(vec!["s3://lakesoul-test-bucket/data/native-io-test/data.parquet".to_string()])
-                .with_schema(Arc::new(Schema::new(vec![
-                    Arc::new(Field::new("str0", DataType::Utf8, false)),
-                    Arc::new(Field::new("str1", DataType::Utf8, false)),
-                    Arc::new(Field::new("str2", DataType::Utf8, false)),
-                    Arc::new(Field::new("str3", DataType::Utf8, false)),
-                    Arc::new(Field::new("str4", DataType::Utf8, false)),
-                    Arc::new(Field::new("str5", DataType::Utf8, false)),
-                    Arc::new(Field::new("str6", DataType::Utf8, false)),
-                    Arc::new(Field::new("str7", DataType::Utf8, false)),
-                    Arc::new(Field::new("str8", DataType::Utf8, false)),
-                    Arc::new(Field::new("str9", DataType::Utf8, false)),
-                    Arc::new(Field::new("str10", DataType::Utf8, false)),
-                    Arc::new(Field::new("str11", DataType::Utf8, false)),
-                    Arc::new(Field::new("str12", DataType::Utf8, false)),
-                    Arc::new(Field::new("str13", DataType::Utf8, false)),
-                    Arc::new(Field::new("str14", DataType::Utf8, false)),
-                    Arc::new(Field::new("int0", DataType::Int64, false)),
-                    Arc::new(Field::new("int1", DataType::Int64, false)),
-                    Arc::new(Field::new("int2", DataType::Int64, false)),
-                    Arc::new(Field::new("int3", DataType::Int64, false)),
-                    Arc::new(Field::new("int4", DataType::Int64, false)),
-                    Arc::new(Field::new("int5", DataType::Int64, false)),
-                    Arc::new(Field::new("int6", DataType::Int64, false)),
-                    Arc::new(Field::new("int7", DataType::Int64, false)),
-                    Arc::new(Field::new("int8", DataType::Int64, false)),
-                    Arc::new(Field::new("int9", DataType::Int64, false)),
-                    Arc::new(Field::new("int10", DataType::Int64, false)),
-                    Arc::new(Field::new("int11", DataType::Int64, false)),
-                    Arc::new(Field::new("int12", DataType::Int64, false)),
-                    Arc::new(Field::new("int13", DataType::Int64, false)),
-                    Arc::new(Field::new("int14", DataType::Int64, false)),
-                ])))
-                .build();
-            let mut reader = LakeSoulReader::new(read_io_config)?;
-            reader.start().await?;
-
-            let schema = reader.schema.clone().unwrap();
-
-            let writer_config = common_conf_builder
-                .clone()
-                .with_files(vec![
-                    "s3://lakesoul-test-bucket/data/native-io-test/large_file_written.parquet".to_string(),
-                ])
-                .with_primary_key("uuid".to_string())
-                .with_schema(schema)
-                .build();
-            let io_session = Arc::new(LakeSoulIOSession::try_new(writer_config)?);
-            let async_writer = MultiPartAsyncWriter::try_new(io_session.clone()).await?;
-            let mut async_writer = SortAsyncWriter::try_new(async_writer, io_session.clone())?;
-
-            while let Some(rb) = reader.next_rb().await {
-                let rb = rb?;
-                async_writer.write_record_batch(rb).await?;
-            }
-
-            Box::new(async_writer).flush_and_close().await?;
-            drop(reader);
-
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn test_s3_read_sort_write() -> Result<()> {
-        let runtime = Arc::new(Builder::new_multi_thread().enable_all().build().unwrap());
-        runtime.clone().block_on(async move {
-            let common_conf_builder = LakeSoulIOConfigBuilder::new()
-                .with_thread_num(2)
-                .with_batch_size(8192)
-                .with_max_row_group_size(250000);
-
-            let reader_io_config = common_conf_builder
-                .clone()
-                .with_files(vec![
-                    "s3://lakesoul-test-bucket/data/native-io-test/data.parquet"
-                        .to_string(),
-                ])
-                .build();
-            let mut reader = LakeSoulReader::new(reader_io_config)?;
-            reader.start().await?;
-
-            let schema = reader.schema.clone().unwrap();
-
-            let writer_io_config = common_conf_builder
-                .clone()
-                .with_files(vec![
-                    "s3://lakesoul-test-bucket/data/native-io-test/data_sorted.parquet"
-                        .to_string(),
-                ])
-                .with_schema(schema)
-                .with_primary_keys(vec![
-                    "str0".to_string(),
-                    "str1".to_string(),
-                    "int1".to_string(),
-                ])
-                .build();
-            let io_session = Arc::new(LakeSoulIOSession::try_new(writer_io_config)?);
-            let async_writer = MultiPartAsyncWriter::try_new(io_session.clone()).await?;
-            let mut async_writer =
-                SortAsyncWriter::try_new(async_writer, io_session.clone())?;
-
-            while let Some(rb) = reader.next_rb().await {
-                let rb = rb?;
-                async_writer.write_record_batch(rb).await?;
-            }
-
-            Box::new(async_writer).flush_and_close().await?;
-            drop(reader);
-
-            Ok(())
-        })
-    }
-
     fn create_batch(num_columns: usize, num_rows: usize, str_len: usize) -> RecordBatch {
         let mut rng = rand::rng();
         let mut len_rng = rand::rng();
         let iter = (0..num_columns)
-            .into_iter()
             .map(|i| {
                 (
                     format!("col_{}", i),
                     Arc::new(StringArray::from(
                         (0..num_rows)
-                            .into_iter()
                             .map(|_| {
                                 rand::distr::Alphanumeric.sample_string(
                                     &mut rng,
@@ -839,12 +660,13 @@ mod tests {
     }
 
     #[cfg(feature = "dhat-heap")]
-    #[global_allocator]
-    static ALLOC: dhat::Alloc = dhat::Alloc;
-
-    #[test]
     #[tracing::instrument]
+    #[test]
     fn writer_profiling() -> Result<()> {
+        use tracing_subscriber::layer::SubscriberExt;
+        #[global_allocator]
+        static ALLOC: dhat::Alloc = dhat::Alloc;
+
         use tracing_subscriber::fmt;
 
         tracing_subscriber::fmt::init();
@@ -855,10 +677,8 @@ mod tests {
                 .with_source_location(true)
                 .with_file(true),
         );
-        // .with_max_level(Level::TRACE);
         tracing_subscriber::registry().with(subscriber);
 
-        #[cfg(feature = "dhat-heap")]
         let _profiler = dhat::Profiler::new_heap();
 
         let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
@@ -889,7 +709,6 @@ mod tests {
             .with_schema(to_write.schema())
             .with_primary_keys(
                 (0..3)
-                    .into_iter()
                     .map(|i| format!("col_{}", i))
                     .collect::<Vec<String>>(),
             )

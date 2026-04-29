@@ -1,5 +1,6 @@
 package com.dmetasoul.lakesoul.lakesoul.io.substrait;
 
+import com.dmetasoul.lakesoul.lakesoul.GlobalResourceManager;
 import com.dmetasoul.lakesoul.lakesoul.io.DateTimeUtils;
 import com.dmetasoul.lakesoul.lakesoul.io.NativeIOBase;
 import com.dmetasoul.lakesoul.lakesoul.io.jnr.JnrLoader;
@@ -85,13 +86,7 @@ public class SubstraitUtil {
             e.printStackTrace();
             throw new RuntimeException("load simple extension failed", e);
         }
-        java.lang.Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                NATIVE_IO_BASE.close();
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }));
+        GlobalResourceManager.register(NATIVE_IO_BASE);
     }
 
     public static Expression and(Expression left, Expression right) {
@@ -104,6 +99,14 @@ public class SubstraitUtil {
 
     public static Expression not(Expression expression) {
         return makeUnary(expression, FUNCTIONS_BOOLEAN, "not:bool", TypeCreator.NULLABLE.BOOLEAN);
+    }
+
+    public static Expression notNull(Expression expression) {
+        return makeUnary(expression, FUNCTIONS_COMPARISON, "is_not_null:any", TypeCreator.NULLABLE.BOOLEAN);
+    }
+
+    public static Expression isNull(Expression expression) {
+        return makeUnary(expression, SubstraitUtil.CompNamespace, "is_null:any", TypeCreator.NULLABLE.BOOLEAN);
     }
 
     public static Expression in(Expression expr, List<Expression.Literal> set) {
@@ -260,7 +263,6 @@ public class SubstraitUtil {
             byte[] bytes = new byte[len];
             exportBuffer.get(0, bytes, 0, len);
             resultPartitionInfo = JniWrapper.parseFrom(bytes).getPartitionInfoList();
-            LIB.free_bytes_result(filterResult);
         } catch (InterruptedException | ExecutionException | TimeoutException | InvalidProtocolBufferException e) {
             throw new RuntimeException(e);
         } finally {
@@ -435,11 +437,17 @@ public class SubstraitUtil {
         }
     }
 
+    public static Expression.Literal typedNull(Type type) {
+        return ExpressionCreator.typedNull(type);
+    }
+
     public static Expression.Literal anyToSubstraitLiteral(Type type, Object any) throws IOException {
         if (type instanceof Type.Date) {
             if (any instanceof Integer) {
-                return ExpressionCreator.date(false, (Integer) any);
-            } else if (any instanceof Date || any instanceof LocalDate) {
+               return ExpressionCreator.date(false, (Integer) any);
+            } else if(any instanceof Long) {
+               return ExpressionCreator.date(false, ((Long) any).intValue());
+	    } else if (any instanceof Date || any instanceof LocalDate) {
                 return ExpressionCreator.date(false, DateTimeUtils$.MODULE$.anyToDays(any));
             }
         }
