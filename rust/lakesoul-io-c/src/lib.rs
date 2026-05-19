@@ -660,6 +660,22 @@ pub extern "C" fn create_lakesoul_reader_from_config(
     convert_to_nonnull(result)
 }
 
+/// Create a new [`SyncSendableMutableLakeSoulReader`] from the [`IOConfig`] with global runtime
+/// and return a [`Reader`] wrapped in [`CResult`]
+#[unsafe(no_mangle)]
+pub extern "C" fn create_lakesoul_reader_from_config_with_global_runtime(
+    config: NonNull<IOConfig>,
+) -> NonNull<CResult<Reader>> {
+    let config: LakeSoulIOConfig = from_opaque(config);
+    let result = match LakeSoulReader::new(config) {
+        Ok(reader) => CResult::<Reader>::new(
+            SyncSendableMutableLakeSoulReader::new_with_global_runtime(reader),
+        ),
+        Err(e) => CResult::<Reader>::error(e.to_string()),
+    };
+    convert_to_nonnull(result)
+}
+
 /// Check if the [`Reader`] is created successfully.
 #[unsafe(no_mangle)]
 pub extern "C" fn check_reader_created(
@@ -1083,13 +1099,16 @@ pub unsafe extern "C" fn create_lakesoul_writer_from_config(
 /// * `writer` must be a valid pointer to a [`CResult<Writer>`] struct
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn check_writer_created(
-    writer: NonNull<CResult<Reader>>,
-) -> *const c_char {
+    mut writer: NonNull<CResult<Writer>>,
+) -> NonNull<CStatus> {
     unsafe {
-        if let Some(err) = writer.as_ref().err.as_ref() {
-            err as *const c_char
+        if writer.as_ref().err.is_null() {
+            convert_to_nonnull(CStatus::new(0))
         } else {
-            std::ptr::null()
+            // take ownership of the error string
+            let s = CString::from_raw(writer.as_ref().err.cast_mut());
+            writer.as_mut().err = std::ptr::null();
+            convert_to_nonnull(CStatus::error(s, -1))
         }
     }
 }
@@ -1147,7 +1166,6 @@ pub unsafe extern "C" fn write_record_batch(
 /// * `writer` must be a valid pointer to a [`CResult<Writer>`] struct
 /// * `schema_addr` must be a valid pointer to the schema address
 /// * `array_addr` must be a valid pointer to the array address
-/// * `callback` must be a valid pointer to a [`ResultCallback`] function
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_record_batch_blocked(
     writer: NonNull<CResult<Writer>>,
