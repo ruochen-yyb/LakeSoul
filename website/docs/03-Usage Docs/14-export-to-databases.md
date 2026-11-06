@@ -107,3 +107,4 @@ For streaming out of the lake, batchsize is set to 1 or 0
 5. Regarding JDBC addresses, users should strictly end them with a '/' character, for instance: jdbc:mysql://172.17.0.2:9030/  
 6. If target table exists before exporting, the primary keys should be exactly the same with source LakeSoul table, or no primary keys in both sides.
 6. When users create a table in Doris, the data model for tables with primary keys should be set to 'Unique', whereas for tables without primary keys, the data model should be set to 'Duplicate'.
+7. Each export job supports only a single table (one LakeSoul table to one target table); specifying multiple tables at once is not supported. To sync multiple tables, submit a separate job for each table.
