@@ -3,9 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Module for the async writer implementation of LakeSoul.
-mod multipart_writer;
 use bytes::BytesMut;
 use datafusion_common::DataFusionError;
+
+mod file_sink_writer;
+pub use file_sink_writer::FileSinkWriter;
+
+mod multipart_writer;
 pub use multipart_writer::MultiPartAsyncWriter;
 
 mod sort_writer;
@@ -19,7 +23,7 @@ mod sendable_writer;
 pub use sendable_writer::AsyncSendableMutableLakeSoulWriter;
 
 use std::{
-    any::Any,
+    collections::HashMap,
     fmt::{Debug, Formatter},
     io::Write,
     sync::Arc,
@@ -38,7 +42,6 @@ use datafusion_physical_plan::{
     execution_plan::{Boundedness, EmissionType},
     metrics::MetricsSet,
 };
-use parquet::file::metadata::ParquetMetaData;
 
 use crate::{Result, session::LakeSoulIOSession};
 
@@ -47,7 +50,10 @@ pub struct FlushOutput {
     pub partition_desc: String,
     pub file_path: String,
     pub object_meta: ObjectMeta,
-    pub file_meta: ParquetMetaData,
+    pub file_exist_cols: Vec<String>,
+    /// The total number of rows in the written file.
+    pub row_count: usize,
+    pub other_info: HashMap<String, String>,
 }
 
 /// The trait for the async batch writer.
@@ -126,7 +132,7 @@ impl Write for InMemBuf {
 pub struct ReceiverStreamExec {
     receiver_stream_builder: AtomicRefCell<Option<RecordBatchReceiverStreamBuilder>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ReceiverStreamExec {
@@ -137,12 +143,12 @@ impl ReceiverStreamExec {
         Self {
             receiver_stream_builder: AtomicRefCell::new(Some(receiver_stream_builder)),
             schema: schema.clone(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 }
@@ -190,15 +196,11 @@ impl ExecutionPlan for ReceiverStreamExec {
         "ReceiverStreamExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

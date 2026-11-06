@@ -6,101 +6,114 @@ from __future__ import annotations
 import copy
 import functools
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, final
 
 import pyarrow as pa
 import pyarrow.dataset as ds
 from typing_extensions import override
 
-from lakesoul._lib._dataset import one_reader  # type: ignore
-
-from ..metadata.meta_ops import (
-    LakeSoulScanPlanPartition,
-    get_scan_plan_partitions,
-    get_schemas_by_table_name,
-)
+from lakesoul._lib._reader import _one_reader
+from lakesoul.metadata import LakeSoulScanPlanPartition
 
 DEFAULT_BATCH_SIZE: int = 2**10
+
+
+@dataclass(frozen=True, slots=True)
+class LakeSoulScanConfig:
+    """Resolved metadata and IO options for one Arrow dataset scan."""
+
+    table_name: str
+    namespace: str
+    schema: pa.Schema
+    partition_schema: pa.Schema | None
+    scan_partitions: tuple[LakeSoulScanPlanPartition, ...]
+    partitions: Mapping[str, str]
+    object_store_options: Mapping[str, str]
+    batch_size: int = DEFAULT_BATCH_SIZE
+    thread_count: int = 1
+    rank: int | None = None
+    world_size: int | None = None
+    filter: ds.Expression | None = None
+    reader_options: Mapping[str, str] = field(default_factory=dict)
 
 
 @final
 class Dataset(ds.Dataset):
     def __init__(  # pyright: ignore[reportMissingSuperCall]
         self,
-        lakesoul_table_name: str,
-        batch_size: int = 1024,
-        thread_count: int = 1,
-        rank: int | None = None,
-        world_size: int | None = None,
-        partitions: dict[str, str] | None = None,
-        retain_partition_columns: bool = False,
-        namespace: str = "default",
-        object_store_configs: dict[str, str] | None = None,
-    ):
-        self._lakesoul_table_name = lakesoul_table_name
-        self._thread_count = thread_count
-        self._namespace = namespace
-        self._retain_partition_columns = retain_partition_columns
+        scan_config: LakeSoulScanConfig,
+    ) -> None:
+        """
+        lakeSoul dataset backed by Arrow reader
+        thread_count: 0 means use cpu count
+        """
+        if not isinstance(scan_config, LakeSoulScanConfig):
+            raise TypeError("scan_config must be a LakeSoulScanConfig")
 
-        rank, world_size = self._check_rank_and_world_size(rank, world_size)
+        self._scan_config = scan_config
+        self._lakesoul_table_name = scan_config.table_name
+        self._thread_count = scan_config.thread_count
+        self._namespace = scan_config.namespace
+
+        rank, world_size = self._check_rank_and_world_size(
+            scan_config.rank, scan_config.world_size
+        )
         self._rank = rank
         self._world_size = world_size
 
-        partitions = partitions or {}
-        self._partitions = partitions
+        self._partitions = dict(scan_config.partitions)
 
-        object_store_configs = object_store_configs or {}
-        self._oss_conf = object_store_configs
+        self._oss_conf = dict(scan_config.object_store_options)
+        self._reader_options = dict(scan_config.reader_options)
 
-        if batch_size <= 0:
+        if scan_config.batch_size <= 0:
             raise ValueError(
-                f"batch_size must be non-negative int; {batch_size} is invalid"
+                f"batch_size must be non-negative int; "
+                f"{scan_config.batch_size} is invalid"
             )
-        self._batch_size = batch_size
+        self._batch_size = scan_config.batch_size
 
-        if thread_count < 0:
+        if scan_config.thread_count < 0:
             raise ValueError(
-                f"thread_count must be non-negative int; {thread_count} is invalid"
+                f"thread_count must be non-negative int; "
+                f"{scan_config.thread_count} is invalid"
             )
-        if thread_count == 0:
+        if scan_config.thread_count == 0:
             import multiprocessing
 
             thread_count = multiprocessing.cpu_count()
+        else:
+            thread_count = scan_config.thread_count
         self._thread_count = thread_count
-        scan_partitions = get_scan_plan_partitions(
-            table_name=self._lakesoul_table_name,
-            partitions=self._partitions,
-            namespace=self._namespace,
-        )
-        target_schema, partition_schema = get_schemas_by_table_name(
-            table_name=self._lakesoul_table_name,
-            namespace=self._namespace,
-            exclude_partition=not self._retain_partition_columns,
-        )
-        self._schema = target_schema
-        self._partition_schema = partition_schema
+        self._schema = scan_config.schema
+        self._partition_schema = scan_config.partition_schema
         filtered_scan_partitions = self._filter_scan_partitions(
-            scan_partitions, self._rank, self._world_size
+            list(scan_config.scan_partitions), self._rank, self._world_size
         )
         file_urls = []
         pks = []
+        partition_infos = []
         for scan_part in filtered_scan_partitions:
             file_urls.append(scan_part.files)
             pks.append(scan_part.primary_keys)
+            partition_infos.append(scan_part.partition_info)
         self._file_urls = file_urls
         self._pks = pks
-        self._filter = None
+        self._partition_infos = partition_infos
+        self._filter = scan_config.filter
 
     def count_rows(
         self,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> int:
         return self.scanner(
             columns=None,
@@ -114,20 +127,21 @@ class Dataset(ds.Dataset):
             memory_pool=memory_pool,
         ).count_rows()
 
-    def filter(self, expression: ds.Expression):
+    def filter(self, expression: ds.Expression) -> None:
         self._filter = expression
 
     def get_fragments(self, filter: ds.Expression | None = None) -> Iterator[Fragment]:
-        partitions = list(self._partitions.items())
         oss_conf = list(self._oss_conf.items())
-        for urls, keys in zip(self._file_urls, self._pks):
+        for urls, keys, partition_info in zip(
+            self._file_urls, self._pks, self._partition_infos
+        ):
             yield Fragment(
                 self._batch_size,
                 self._thread_count,
                 self._schema,
                 urls,
                 keys,
-                partitions,
+                partition_info,
                 oss_conf,
                 self._partition_schema,
                 filter if filter is not None else self._filter,
@@ -136,15 +150,15 @@ class Dataset(ds.Dataset):
     def head(
         self,
         num_rows: int,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> pa.Table:
         return self.scanner(
             columns,
@@ -161,46 +175,46 @@ class Dataset(ds.Dataset):
     def join(
         self,
         right_dataset: ds.Dataset,
-        keys,
-        right_keys,
-        join_type,
-        left_suffix,
-        right_suffix,
-        coalesce_keys,
-        use_threads,
-    ):
+        keys: str | list[str],
+        right_keys: str | list[str],
+        join_type: str,
+        left_suffix: str | None,
+        right_suffix: str | None,
+        coalesce_keys: bool,
+        use_threads: bool,
+    ) -> ds.InMemoryDataset:
         raise NotImplementedError("this method is not supported")
 
     def join_asof(
         self,
         right_dataset: ds.Dataset,
         on: str,
-        by,
+        by: str | list[str] | None,
         tolerance: int,
-        right_on=None,
-        right_by=None,
-    ):
+        right_on: str | None = None,
+        right_by: str | list[str] | None = None,
+    ) -> ds.InMemoryDataset:
         raise NotImplementedError("this method is not supported")
 
     @property
-    def partition_expression(self):
+    def partition_expression(self) -> ds.Expression:
         raise NotImplementedError("this method is not supported")
 
-    def replace_schema(self, schema: pa.Schema):
+    def replace_schema(self, schema: pa.Schema) -> Dataset:
         raise NotImplementedError("this method is not supported")
 
     def scanner(
         self,
-        columns: list[str] | None = None,
+        columns: list[str] | list[int] | int | None = None,
         filter: ds.Expression | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
         use_threads: bool = True,
-        cache_metadata=None,
-        memory_pool=None,
-    ):
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Scanner:
         return Scanner.from_dataset(
             self,
             columns=columns,  # pyright: ignore[reportCallIssue]
@@ -215,38 +229,40 @@ class Dataset(ds.Dataset):
         )
 
     @property
-    def schema(self):
+    def schema(self) -> pa.Schema:
         return self._schema
 
-    def sort_by(self, sorting, **kwargs):
+    def sort_by(
+        self, sorting: str | list[tuple[str, str]], **kwargs: Any
+    ) -> ds.InMemoryDataset:
         raise NotImplementedError("this method is not supported")
 
     def take(
         self,
-        indices,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
-    ):
+        indices: list[int] | pa.Array,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
         raise NotImplementedError("this method is not supported")
 
     def to_batches(
         self,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns,
@@ -262,15 +278,15 @@ class Dataset(ds.Dataset):
 
     def to_table(
         self,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> pa.Table:
         return self.scanner(
             columns,
@@ -285,18 +301,13 @@ class Dataset(ds.Dataset):
         ).to_table()
 
     @override
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[type[Dataset], tuple[LakeSoulScanConfig]]:
         """custom serialize"""
-        return self.__class__, (
-            self._lakesoul_table_name,
-            self._batch_size,
-            self._thread_count,
-            self._rank,
-            self._world_size,
-            self._partitions,
-            self._retain_partition_columns,
-            self._namespace,
-        )
+        return self.__class__, (self._scan_config,)
+
+    @property
+    def scan_config(self) -> LakeSoulScanConfig:
+        return self._scan_config
 
     def thread_count(self) -> int:
         return self._thread_count
@@ -306,6 +317,9 @@ class Dataset(ds.Dataset):
 
     def primary_keys(self) -> list[list[str]]:
         return self._pks
+
+    def partition_infos(self) -> list[list[tuple[str, str]]]:
+        return self._partition_infos
 
     def partitions(self) -> dict[str, str]:
         return self._partitions
@@ -338,7 +352,7 @@ class Dataset(ds.Dataset):
 
     def _try_get_rank_and_world_size(self) -> tuple[int | None, int | None]:
         try:
-            import torch.distributed as dist  # type: ignore
+            import torch.distributed as dist
         except ImportError:
             return None, None
         try:
@@ -346,10 +360,7 @@ class Dataset(ds.Dataset):
             world_size = dist.get_world_size()
             return rank, world_size
         except Exception as e:
-            print("An exception occurred to obtain PyTorch distributed rank: ", e)
-            print(
-                "If you are not using PyTorch's distributed runtime, just ignore this error"
-            )
+            logging.debug("Unable to obtain PyTorch distributed rank: %s", e)
             return None, None
 
     def _filter_scan_partitions(
@@ -395,10 +406,10 @@ def check_parameters(
     check_fragment_scan_options: bool = True,
     check_cache_metadata: bool = True,
     check_memory_pool: bool = True,
-):
-    def decorator(func):
+) -> Callable[..., Any]:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             if (
                 check_columns
                 and kwargs.get("columns") is not None
@@ -452,7 +463,7 @@ class Fragment(ds.Fragment):
         oss_conf: list[tuple[str, str]],
         partition_schema: pa.Schema | None,
         filter: ds.Expression | None,
-    ):
+    ) -> None:
         self._batch_size = batch_size
         self._thread_count = thread_count
         self._schema = pa.schema(schema)  # copy
@@ -466,7 +477,7 @@ class Fragment(ds.Fragment):
         self._filter = filter
 
     @property
-    def partition_expression(self):
+    def partition_expression(self) -> ds.Expression:
         raise NotImplementedError
 
     @property
@@ -475,14 +486,14 @@ class Fragment(ds.Fragment):
 
     def count_rows(
         self,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> int:
         return self.scanner(
             None,
@@ -500,16 +511,16 @@ class Fragment(ds.Fragment):
     def head(
         self,
         num_rows: int,
-        schema=None,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> pa.Table:
         return self.scanner(
             schema,
@@ -530,12 +541,12 @@ class Fragment(ds.Fragment):
         columns: list[str] | None = None,
         filter: ds.Expression | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
         use_threads: bool = True,
-        cache_metadata=None,
-        memory_pool=None,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> Scanner:
         return Scanner.from_fragment(
             self,
@@ -553,31 +564,31 @@ class Fragment(ds.Fragment):
 
     def take(
         self,
-        indices,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
-    ):
+        indices: list[int] | pa.Array,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> pa.Table:
         raise NotImplementedError("this method is not supported")
 
     def to_batches(
         self,
-        schema=None,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             schema=schema,
@@ -594,16 +605,16 @@ class Fragment(ds.Fragment):
 
     def to_table(
         self,
-        schema=None,
-        columns=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
-        use_threads=True,
-        cache_metadata=None,
-        memory_pool=None,
+        schema: pa.Schema | None = None,
+        columns: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool = True,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> pa.Table:
         return self.scanner(
             schema=schema,
@@ -616,7 +627,7 @@ class Fragment(ds.Fragment):
             use_threads=use_threads,
             cache_metadata=cache_metadata,
             memory_pool=memory_pool,
-        ).to_batches()
+        ).to_table()
 
     def batch_size(self) -> int:
         return self._batch_size
@@ -662,18 +673,18 @@ class Scanner(ds.Scanner):
         target_schema: pa.Schema,
         file_urls: list[list[str]],
         pks: list[list[str]],
-        partitions: list[tuple[str, str]],
+        partition_infos: list[list[tuple[str, str]]],
         oss_conf: list[tuple[str, str]],
         partiion_schema: pa.Schema | None,
         filter: bytes | None,
-    ):
+    ) -> None:
         self._batch_size = batch_size
         self._thread_count = thread_count
         self._target_schema = pa.schema(target_schema)
         self._partition_schema = pa.schema(partiion_schema) if partiion_schema else None
         self._file_urls = copy.deepcopy(file_urls)
         self._pks = copy.deepcopy(pks)
-        self._partition = partitions
+        self._partition_infos = copy.deepcopy(partition_infos)
         self._oss_conf = oss_conf
         self._filter = filter
 
@@ -682,18 +693,18 @@ class Scanner(ds.Scanner):
 
     @staticmethod
     def from_batches(
-        source,
+        source: Any,
         *,
-        schema=None,
-        colums=None,
-        filter=None,
-        batch_size=DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_scan_options=None,
-        use_threads=None,
-        cache_metadata=None,
-        memory_pool=None,
-    ):
+        schema: pa.Schema | None = None,
+        colums: list[str] | None = None,
+        filter: ds.Expression | None = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
+        use_threads: bool | None = None,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
+    ) -> Scanner:
         raise NotImplementedError("the method is not supported")
 
     @staticmethod
@@ -704,12 +715,12 @@ class Scanner(ds.Scanner):
         columns: list[str] | None = None,
         filter: ds.Expression | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
         use_threads: bool = True,
-        cache_metadata=None,
-        memory_pool=None,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> Scanner:
         logging.debug(f"from_dataset filter: {filter}")
         if not use_threads:
@@ -725,17 +736,19 @@ class Scanner(ds.Scanner):
         if filter is not None:
             filter = bytes(filter.to_substrait(dataset.schema))  # copy
 
-        return Scanner(
+        scanner = Scanner(
             batch_size,
             thread_count,
             target_schema,
             dataset.file_urls(),
             dataset.primary_keys(),
-            list(dataset.partitions().items()),
+            dataset.partition_infos(),
             list(dataset.oss_conf().items()),
             dataset.partition_schema(),
             filter,
         )
+        scanner._reader_options = getattr(dataset, '_reader_options', {})
+        return scanner
 
     @staticmethod
     @check_parameters
@@ -746,12 +759,12 @@ class Scanner(ds.Scanner):
         columns: list[str] | None = None,
         filter: ds.Expression | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        batch_readahead=None,
-        fragment_readahead=None,
-        fragment_scan_options=None,
+        batch_readahead: int | None = None,
+        fragment_readahead: int | None = None,
+        fragment_scan_options: Any | None = None,
         use_threads: bool = True,
-        cache_metadata=None,
-        memory_pool=None,
+        cache_metadata: bool | None = None,
+        memory_pool: pa.MemoryPool | None = None,
     ) -> Scanner:
         logging.debug(f"from_fragement filter: {filter}")
         if not use_threads:
@@ -773,7 +786,7 @@ class Scanner(ds.Scanner):
             schema,
             [fragment.file_urls()],
             [fragment.primary_keys()],
-            fragment.partitions(),
+            [fragment.partitions()],
             fragment.oss_conf(),
             fragment.partition_schema(),
             filter,
@@ -794,10 +807,10 @@ class Scanner(ds.Scanner):
             total_rows += batch.num_rows
         return pa.Table.from_batches(batches)
 
-    def scan_batches(self):
+    def scan_batches(self) -> Iterator[ds.TaggedRecordBatch]:
         raise NotImplementedError("this method is not supported")
 
-    def take(self, indices):
+    def take(self, indices: list[int] | pa.Array) -> pa.Table:
         raise NotImplementedError("this method is not supported")
 
     def to_batches(self) -> Iterator[pa.RecordBatch]:
@@ -806,42 +819,22 @@ class Scanner(ds.Scanner):
             yield rb
 
     def to_reader(self) -> pa.RecordBatchReader:
-        return one_reader(
+        return _one_reader(
             self._batch_size,
             self._thread_count,
             self._target_schema,
             self._file_urls,
             self._pks,
-            self._partition,
+            self._partition_infos,
             self._oss_conf,
             self._partition_schema,
             self._filter,
+            list(opts.items()) if (opts := getattr(self, '_reader_options', {})) else None,
         )
 
     def to_table(self) -> pa.Table:
         return self.to_reader().read_all()
 
 
-def lakesoul_dataset(
-    table_name: str,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    thread_count: int = 1,
-    rank: int | None = None,
-    world_size: int | None = None,
-    partitions: dict[str, str] | None = None,
-    retain_partition_columns: bool = True,
-    namespace: str = "default",
-    object_store_configs: dict[str, str] | None = None,
-) -> Dataset:
-    dataset = Dataset(
-        table_name,
-        batch_size=batch_size,
-        thread_count=thread_count,
-        rank=rank,
-        world_size=world_size,
-        partitions=partitions,
-        retain_partition_columns=retain_partition_columns,
-        namespace=namespace,
-        object_store_configs=object_store_configs,
-    )
-    return dataset
+def lakesoul_dataset(scan_config: LakeSoulScanConfig) -> Dataset:
+    return Dataset(scan_config)

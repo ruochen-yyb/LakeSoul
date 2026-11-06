@@ -29,6 +29,8 @@ use url::Url;
 use crate::planner::LakeSoulQueryPlanner;
 
 // re export
+pub use datafusion::*;
+pub use lakesoul_common::ser;
 pub use lakesoul_metadata::{MetaDataClient, MetaDataClientRef};
 
 pub mod catalog;
@@ -36,7 +38,6 @@ pub mod cli;
 pub mod datasource;
 pub mod lakesoul_table;
 pub mod planner;
-pub mod serialize;
 pub mod tpch;
 
 #[cfg(feature = "adbc")]
@@ -61,7 +62,7 @@ pub fn create_lakesoul_session_ctx(
     session_config
         .options_mut()
         .sql_parser
-        .map_string_types_to_utf8view = false;
+        .map_string_types_to_utf8view = false; // TODO(jiax): check this
     session_config
         .options_mut()
         .optimizer

@@ -10,14 +10,14 @@
 //!
 //! # Examples
 //!
-//! ```rust
+//! ```no_run
+//! # fn main() -> lakesoul_io::Result<()> {
 //! # tokio_test::block_on(async {
-//! use lakesoul_io::lakesoul_reader::LakeSoulReader;
-//! use lakesoul_io::lakesoul_io_config::LakeSoulIOConfigBuilder;
+//! use lakesoul_io::config::LakeSoulIOConfig;
+//! use lakesoul_io::reader::LakeSoulReader;
 //!
-//! // Configure and create a reader
-//! let config = LakeSoulIOConfigBuilder::new()
-//!     .with_files(vec!["path/to/file.parquet"])
+//! let config = LakeSoulIOConfig::builder()
+//!     .with_file("path/to/file.parquet")
 //!     .with_thread_num(1)
 //!     .with_batch_size(256)
 //!     .build();
@@ -25,12 +25,14 @@
 //! let mut reader = LakeSoulReader::new(config)?;
 //! reader.start().await?;
 //!
-//! // Read data
 //! while let Some(batch) = reader.next_rb().await {
 //!     let record_batch = batch?;
-//!     // Process the record batch
+//!     let _row_count = record_batch.num_rows();
 //! }
-//!})
+//! # Ok::<(), rootcause::Report>(())
+//! # })?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Features
@@ -45,7 +47,6 @@
 //! - `file_format` - datafusion file format impl
 //! - `filter` - Filter pushdown support
 //! - `helpers` - Helper functions for physical plan construction and execution
-//! - `local_sensitive_hash` - Local sensitive hashing support
 //! - `object_store` - obejct store configuration
 //! - `physical_plan` - Physical Plan implementations
 //! - `reader` - Core reading functionality
@@ -67,12 +68,12 @@ pub mod constant;
 pub mod file_format;
 pub mod filter;
 pub mod helpers;
-pub mod local_sensitive_hash;
 pub mod object_store;
 pub mod physical_plan;
 pub mod reader;
 pub mod session;
 pub mod utils;
+pub mod vector;
 pub mod writer;
 
 pub mod mem;

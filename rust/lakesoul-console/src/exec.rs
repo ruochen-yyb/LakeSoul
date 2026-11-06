@@ -4,7 +4,7 @@
 
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use std::{fs::File, io::BufReader};
 
@@ -175,7 +175,6 @@ async fn exec(
     ctx: &SessionContext,
     sql: &str,
 ) -> Result<(usize, Vec<RecordBatch>, Arc<Schema>)> {
-    trace!("begin exec sql");
     let stmt = ctx.state().sql_to_statement(sql, &Dialect::PostgreSQL)?;
     if let Some(u) = parse_use(stmt.clone()) {
         match u {
@@ -232,6 +231,14 @@ async fn exec(
     Ok((row_count, res, schema))
 }
 
+fn history_path() -> &'static str {
+    static HISTORY_PATH: OnceLock<String> = OnceLock::new();
+    HISTORY_PATH.get_or_init(|| {
+        std::env::var("LAKESOUL_CONSOLE_HISTORY_PATH")
+            .unwrap_or(String::from("/tmp/console.history"))
+    })
+}
+
 #[tracing::instrument(skip(ctx, printer))]
 async fn exec_and_print(
     ctx: &SessionContext,
@@ -247,7 +254,7 @@ async fn exec_and_print(
 
 pub async fn exec_from_repl(ctx: &SessionContext, printer: &Printer) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new()?;
-    rl.load_history("console.history").ok();
+    rl.load_history(history_path()).ok();
     loop {
         match rl.readline("lakesoul >> ") {
             Ok(line) => {
@@ -278,6 +285,6 @@ pub async fn exec_from_repl(ctx: &SessionContext, printer: &Printer) -> Result<(
         }
     }
 
-    rl.save_history("console.history")?;
+    rl.save_history(history_path())?;
     Ok(())
 }

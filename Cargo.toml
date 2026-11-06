@@ -14,6 +14,8 @@ members = [
   "rust/lakesoul-flight",
   "rust/lakesoul-s3-proxy",
   "rust/lakesoul-console",
+  "rust/lakesoul-common",
+  "rust/lakesoul-vector",
   "python",
 ]
 resolver = "3"
@@ -35,40 +37,44 @@ inherits = "release"
 debug = true
 opt-level = 2
 
-[profile.test]
-# Use a slightly better optimization level for tests
+[profile.test-fast]
+inherits = "test"
+# Use a slightly better optimization level for ci-tests
 opt-level = 1
 
 [workspace.dependencies]
 # datafusion
-datafusion = { version = "51" }
-datafusion-common = { version = "51" }
-datafusion-common-runtime = { version = "51" }
-datafusion-session = { version = "51" }
-datafusion-catalog-listing = { version = "51" }
-datafusion-expr = { version = "51" }
-datafusion-physical-expr = { version = "51" }
-datafusion-physical-plan = { version = "51" }
-datafusion-execution = { version = "51" }
-datafusion-datasource = { version = "51" }
-datafusion-datasource-parquet = { version = "51" }
-datafusion-substrait = { version = "51" }
-datafusion-python = { version = "51" }
+datafusion = { version = "54" }
+datafusion-common = { version = "54" }
+datafusion-common-runtime = { version = "54" }
+datafusion-session = { version = "54" }
+datafusion-catalog-listing = { version = "54" }
+datafusion-expr = { version = "54" }
+datafusion-physical-expr = { version = "54" }
+datafusion-physical-plan = { version = "54" }
+datafusion-execution = { version = "54" }
+datafusion-datasource = { version = "54" }
+datafusion-datasource-parquet = { version = "54" }
+datafusion-substrait = { version = "54" }
+datafusion-python = { version = "54" }
 # arrow
-arrow = { version = "57", features = ["prettyprint"] }
-arrow-schema = { version = "57", features = ["serde"] }
-arrow-array = { version = "57", features = ["chrono-tz", "ffi"] }
-arrow-buffer = { version = "57" }
-arrow-cast = { version = "57" }
-arrow-arith = { version = "57" }
-arrow-ipc = { version = "57" }
-arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
-arrow-pyarrow = { version = "57" }
-parquet = { version = "57", default-features = true, features = [
+arrow = { version = "58", features = ["prettyprint"] }
+arrow-schema = { version = "58", features = ["serde"] }
+arrow-array = { version = "58", features = ["chrono-tz", "ffi"] }
+arrow-buffer = { version = "58" }
+arrow-cast = { version = "58" }
+arrow-arith = { version = "58" }
+arrow-ipc = { version = "58" }
+arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
+arrow-pyarrow = { version = "58" }
+parquet = { version = "58", default-features = true, features = [
   "async",
   "encryption",
 ] }
-object_store = { version = "0.12", features = ["aws", "http"] }
+object_store = { version = "0.13", features = ["aws", "http"] }
+# vortex
+vortex = { version = "0.76" }
+vortex-datafusion = { version = "0.76"}
 # async
 futures = "0.3"
 async-trait = "0.1"
@@ -86,10 +92,10 @@ metrics = "0.24"
 cached = { version = "0.54.0", features = ["async_tokio_rt_multi_thread"] }
 # cli
 clap = { version = "4.4", features = ["derive"] }
-# utils
 atomic_refcell = "0.1.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["clock", "unstable-locales"] }
+dashmap = { version = "6.1" }
 hex = "0.4"
 jsonwebtoken = { version = "9", default-features = false }
 url = "2"

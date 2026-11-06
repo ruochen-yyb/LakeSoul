@@ -33,8 +33,8 @@ use datafusion_physical_plan::memory::LazyBatchGenerator;
 use datafusion_session::Session;
 use datafusion_substrait::substrait::proto::Plan;
 use futures::{StreamExt, TryStreamExt};
-use object_store::ObjectMeta;
 use object_store::path::Path;
+use object_store::{ObjectMeta, ObjectStoreExt};
 use parquet::file::metadata::ParquetMetaData;
 use proto::proto::entity::JniWrapper;
 use rand::distr::SampleString;
@@ -46,6 +46,7 @@ use std::iter::zip;
 use std::{collections::HashMap, fmt, sync::Arc};
 use tokio::runtime::Builder;
 use url::Url;
+use vortex::file::Footer;
 
 use self::transform::uniform_schema;
 use crate::{
@@ -892,17 +893,32 @@ pub fn get_batch_memory_size(batch: &RecordBatch) -> Result<usize> {
         .sum())
 }
 
-/// Gets the file exist columns of a [`ParquetMetaData`].
-/// This function is only used for Parquet
-pub fn get_file_exist_col(metadata: &ParquetMetaData) -> String {
-    metadata
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .map(|col| col.name().to_string())
-        .collect::<Vec<_>>()
-        .join(",")
+/// Gets the file exist columns of underlying file format.
+pub trait FileExistCols {
+    fn get_file_exists_cols(&self) -> Vec<String>;
+}
+
+impl FileExistCols for ParquetMetaData {
+    fn get_file_exists_cols(&self) -> Vec<String> {
+        self.file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .map(|col| col.name().to_string())
+            .collect::<Vec<_>>()
+    }
+}
+
+impl FileExistCols for Footer {
+    fn get_file_exists_cols(&self) -> Vec<String> {
+        match self.dtype().as_struct_fields_opt() {
+            Some(sf) => sf.names().iter().map(ToString::to_string).collect(),
+            None => {
+                warn!("file has no struct fields");
+                vec![]
+            }
+        }
+    }
 }
 
 /// Extracts the hash bucket ID from a file path.
@@ -1079,13 +1095,15 @@ pub fn extract_scalar_value_from_expr(equality: &ColumnEquality) -> Option<&Scal
 
 #[derive(Debug)]
 pub struct InMemGenerator {
+    initial_batches: Vec<RecordBatch>,
     batches: VecDeque<RecordBatch>,
 }
 
 impl InMemGenerator {
     pub fn try_new(batches: Vec<RecordBatch>) -> Result<Self> {
         Ok(Self {
-            batches: VecDeque::from(batches),
+            batches: VecDeque::from(batches.clone()),
+            initial_batches: batches,
         })
     }
 }
@@ -1103,6 +1121,13 @@ impl LazyBatchGenerator for InMemGenerator {
 
     fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
         Ok(self.batches.pop_front())
+    }
+
+    fn reset_state(&self) -> Arc<parking_lot::RwLock<dyn LazyBatchGenerator>> {
+        Arc::new(parking_lot::RwLock::new(Self {
+            initial_batches: self.initial_batches.clone(),
+            batches: VecDeque::from(self.initial_batches.clone()),
+        }))
     }
 }
 

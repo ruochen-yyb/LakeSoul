@@ -12,12 +12,25 @@ name = "buf_bench"
 harness = false
 
 [[bench]]
+name = "format_write_bench"
+harness = false
+
+[[bench]]
 name = "spill_bench"
+harness = false
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[[bench]]
+name = "partial_merge"
 harness = false
 
 [dependencies]
 # lakesoul
 proto = { path = "../proto" }
+lakesoul-vector = { path = "../lakesoul-vector" }
 # datafusion
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
@@ -39,6 +52,10 @@ arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
 parquet = { workspace = true }
 object_store = { workspace = true }
+# vortex
+vortex = { workspace = true }
+vortex-datafusion = { workspace = true}
+
 # async
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -68,6 +85,7 @@ atomic_refcell = { workspace = true }
 derivative = { workspace = true }
 url = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
 half = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
@@ -124,6 +142,7 @@ tempfile = { workspace = true }
 whoami = "1.5"
 tracing-subscriber = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports"] }
+mimalloc = "0.1.52"
 gungraun = "0.17.0"
 num-format = "0.4.4"
 

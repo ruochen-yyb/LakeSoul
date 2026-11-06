@@ -5,7 +5,6 @@
 //! This module provides the implementation of the repartition operator.
 
 use std::{
-    any::Any,
     collections::HashMap,
     pin::Pin,
     sync::Arc,
@@ -380,7 +379,7 @@ pub struct RepartitionByRangeAndHashExec {
     metrics: ExecutionPlanMetricsSet,
 
     /// Execution properties
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl RepartitionByRangeAndHashExec {
@@ -463,12 +462,12 @@ impl RepartitionByRangeAndHashExec {
 
             if physical_exprs_equal(&lhs, &rhs) {
                 return Ok(Self {
-                    plan_properties: PlanProperties::new(
+                    plan_properties: Arc::new(PlanProperties::new(
                         EquivalenceProperties::new(input.schema()),
                         hash_partitioning.clone(),
                         EmissionType::Incremental,
                         Boundedness::Bounded,
-                    ),
+                    )),
                     input,
                     range_partitioning_expr,
                     hash_partitioning,
@@ -668,17 +667,12 @@ impl ExecutionPlan for RepartitionByRangeAndHashExec {
         Some(self.metrics.clone_inner())
     }
 
-    /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Get the schema for this execution plan
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -807,7 +801,10 @@ impl ExecutionPlan for RepartitionByRangeAndHashExec {
         Ok(Box::pin(stream))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> DFResult<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 }

@@ -206,7 +206,7 @@ object LakeSoulFullTable {
 object LakeSoulTableRelationV2 {
   def unapply(plan: LogicalPlan): Option[LakeSoulTableV2] = plan match {
     case DataSourceV2Relation(table: LakeSoulTableV2, _, _, _, _) => Some(table)
-    case DataSourceV2ScanRelation(DataSourceV2Relation(table: LakeSoulTableV2, _, _, _, _), _, _, _) => Some(table)
+    case DataSourceV2ScanRelation(DataSourceV2Relation(table: LakeSoulTableV2, _, _, _, _), _, _, _, _) => Some(table)
     case _ => None
   }
 }
@@ -237,7 +237,10 @@ object LakeSoulTableProperties {
 
   val onlySaveOnceCompaction = "only_save_once_compaction"
 
-  val extraTblProps: Set[String] = Set(lakeSoulCDCChangePropKey, partitionTtl, compactionTtl, onlySaveOnceCompaction, skipMergeOnRead)
+  val fileFormat = LakeSoulOptions.FILE_FORMAT
+
+  val extraTblProps: Set[String] = Set(lakeSoulCDCChangePropKey, partitionTtl, compactionTtl,
+    onlySaveOnceCompaction, skipMergeOnRead, fileFormat)
 
   def isLakeSoulTableProperty(name: String): Boolean = {
     extraTblProps.contains(name)

@@ -4,6 +4,7 @@
 
 //! Implementation of the multipart writer.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -13,7 +14,7 @@ use datafusion_common::{DataFusionError, project_schema};
 use datafusion_datasource::ListingTableUrl;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_session::Session;
-use object_store::{ObjectStore, WriteMultipart, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart, path::Path};
 use parquet::basic::ZstdLevel;
 use parquet::{
     arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties,
@@ -21,10 +22,11 @@ use parquet::{
 use rootcause::{bail, report};
 use url::Url;
 
+use crate::helpers::FileExistCols;
 use crate::session::LakeSoulIOSession;
 use crate::{
     Result,
-    constant::TBD_PARTITION_DESC,
+    constant::DEFAULT_PARTITION_DESC,
     helpers::get_batch_memory_size,
     helpers::transform::{uniform_record_batch, uniform_schema},
 };
@@ -59,7 +61,7 @@ pub struct MultiPartAsyncWriter {
 }
 
 impl MultiPartAsyncWriter {
-    #[instrument(skip_all, fields(err))]
+    #[instrument(skip_all, err)]
     pub async fn try_new(io_session: Arc<LakeSoulIOSession>) -> Result<Self> {
         let config = io_session.io_config();
         let task_context = io_session.task_ctx();
@@ -217,11 +219,20 @@ impl AsyncBatchWriter for MultiPartAsyncWriter {
                 .path(),
         )?;
         let object_meta = this.object_store.head(&path).await?;
+
+        let file_exist_cols = metadata.get_file_exists_cols();
+        let other_info = HashMap::from([(
+            String::from("num_row_groups"),
+            metadata.num_row_groups().to_string(),
+        )]);
+
         Ok(vec![FlushOutput {
-            partition_desc: TBD_PARTITION_DESC.to_string(),
+            partition_desc: DEFAULT_PARTITION_DESC.to_string(),
             file_path,
             object_meta,
-            file_meta: metadata,
+            row_count: metadata.file_metadata().num_rows() as usize,
+            file_exist_cols,
+            other_info,
         }])
     }
 

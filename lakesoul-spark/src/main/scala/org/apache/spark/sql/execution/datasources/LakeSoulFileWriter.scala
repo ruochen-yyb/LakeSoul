@@ -161,7 +161,7 @@ object LakeSoulFileWriter extends Logging {
     val nativeIOEnable = sparkSession.sessionState.conf.getConf(LakeSoulSQLConf.NATIVE_IO_ENABLE)
 
     val isArrowColumnarInput = nativeIOEnable &&
-      ((isCompaction && !isCDC) // none cdc compaction compaction is a arrow columnar scan
+      ((isCompaction && !isCDC) // none cdc compaction is an arrow columnar scan
         || GlutenUtils.isGlutenEnabled)
     // for compaction, only when static bucket!=-1
     // for all other cases, only when no partition && no bucket spec
@@ -268,7 +268,7 @@ object LakeSoulFileWriter extends Logging {
       case cause: Throwable =>
         logError(s"Aborting job", cause)
         committer.abortJob(job)
-        throw QueryExecutionErrors.jobAbortedError(cause)
+        throw QueryExecutionErrors.writingJobFailedError(cause)
     }
   }
 
@@ -348,7 +348,7 @@ object LakeSoulFileWriter extends Logging {
         // We throw the exception and let Executor throw ExceptionFailure to abort the job.
         throw new TaskOutputFileAlreadyExistException(f)
       case t: Throwable =>
-        throw QueryExecutionErrors.taskFailedWhileWritingRowsError(t)
+        throw QueryExecutionErrors.taskFailedWhileWritingRowsError(description.path, t)
     }
   }
 

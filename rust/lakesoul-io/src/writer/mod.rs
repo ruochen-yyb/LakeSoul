@@ -10,16 +10,30 @@
 //!
 //! # Examples
 //!
-//! ```rust
-//! use lakesoul_io::lakesoul_writer::SyncSendableMutableLakeSoulWriter;
-//! use lakesoul_io::lakesoul_io_config::LakeSoulIOConfigBuilder;
+//! ```no_run
+//! use std::sync::Arc;
 //!
-//! let config = LakeSoulIOConfigBuilder::new()
-//!     .with_files(vec!["path/to/file.parquet"])
+//! use arrow_array::{Int64Array, RecordBatch};
+//! use arrow_schema::{DataType, Field, Schema};
+//! use lakesoul_io::config::LakeSoulIOConfig;
+//! use lakesoul_io::writer::SyncSendableMutableLakeSoulWriter;
+//!
+//! let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+//! let record_batch = RecordBatch::try_new(
+//!     schema.clone(),
+//!     vec![Arc::new(Int64Array::from_iter_values([1_i64, 2, 3]))],
+//! )
+//! .unwrap();
+//!
+//! let config = LakeSoulIOConfig::builder()
+//!     .with_file("path/to/file.parquet")
+//!     .with_schema(schema)
+//!     .with_hash_bucket_num("1")
 //!     .build();
 //!
 //! let runtime = tokio::runtime::Runtime::new().unwrap();
-//! let mut writer = SyncSendableMutableLakeSoulWriter::try_new(config, runtime).unwrap();
+//! let mut writer =
+//!     SyncSendableMutableLakeSoulWriter::from_io_config(config, runtime).unwrap();
 //! writer.write_batch(record_batch).unwrap();
 //! writer.flush_and_close().unwrap();
 //! ```
@@ -27,24 +41,32 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array as OtherArray, ListArray};
-use arrow::datatypes::{DataType, Field};
 use arrow_array::RecordBatch;
-use arrow_schema::{SchemaBuilder, SchemaRef};
+use arrow_schema::SchemaRef;
+use datafusion_common::config::TableParquetOptions;
+use datafusion_datasource::{
+    ListingTableUrl,
+    file_groups::FileGroup,
+    file_sink_config::{FileOutputMode, FileSink, FileSinkConfig},
+};
+use datafusion_datasource_parquet::ParquetSink;
+use datafusion_expr::dml::InsertOp;
 use rootcause::{bail, report};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
+use vortex::io::session::RuntimeSessionExt;
+use vortex::{VortexSessionDefault, session::VortexSession};
 
 use crate::Result;
 use crate::config::{IOSchema, LakeSoulIOConfig};
+use crate::file_format::{PhysicalFormat, vortex::VortexSink};
+use crate::helpers::get_batch_memory_size;
 use crate::helpers::transform::uniform_schema;
-use crate::helpers::{get_batch_memory_size, get_file_exist_col};
-use crate::local_sensitive_hash::LSH;
 use crate::session::LakeSoulIOSession;
 use crate::utils::random_str;
 use crate::writer::async_writer::FlushOutput;
 use async_writer::{
-    AsyncBatchWriter, MultiPartAsyncWriter, PartitioningAsyncWriter, SortAsyncWriter,
+    AsyncBatchWriter, FileSinkWriter, PartitioningAsyncWriter, SortAsyncWriter,
 };
 
 pub mod async_writer;
@@ -92,40 +114,127 @@ pub async fn create_writer(
         // no need to keep row order
         // sort primary key table
         writer_io_config.target_schema = IOSchema(uniform_schema(writer_schema));
+        // use prefix to generate file path
         if writer_io_config.files.is_empty() && !writer_io_config.prefix().is_empty() {
             writer_io_config.files = vec![format!(
-                "{}/part-{}_{:0>4}.parquet",
+                "{}/part-{}_{:0>4}.{}",
                 writer_io_config.prefix(),
                 random_str(16),
-                writer_io_config.hash_bucket_id()
+                writer_io_config.hash_bucket_id(),
+                writer_io_config.physical_format()?.extension()
             )];
         }
-        let writer = MultiPartAsyncWriter::try_new(Arc::new(
-            io_session.with_io_config(writer_io_config),
-        ))
-        .await?;
+        let writer =
+            create_leaf_writer(Arc::new(io_session.with_io_config(writer_io_config)))?;
         // use original config
         info!("use sort writer");
         Box::new(SortAsyncWriter::try_new(writer, io_session.clone())?)
     } else {
         // else multipart
         writer_io_config.target_schema = IOSchema(uniform_schema(writer_schema));
+        // use prefix to generate file path
         if writer_io_config.files.is_empty() && !writer_io_config.prefix().is_empty() {
             writer_io_config.files = vec![format!(
-                "{}/part-{}_{:0>4}.parquet",
+                "{}/part-{}_{:0>4}.{}",
                 writer_io_config.prefix(),
                 random_str(16),
-                writer_io_config.hash_bucket_id()
+                writer_io_config.hash_bucket_id(),
+                writer_io_config.physical_format()?.extension()
             )];
         }
-        let writer = MultiPartAsyncWriter::try_new(Arc::new(
-            io_session.with_io_config(writer_io_config),
-        ))
-        .await?;
-        info!("use multipart writer");
-        Box::new(writer)
+        let writer =
+            create_leaf_writer(Arc::new(io_session.with_io_config(writer_io_config)))?;
+        info!("use file sink writer");
+        writer
     };
     Ok(writer)
+}
+
+pub(crate) fn create_leaf_writer(
+    io_session: Arc<LakeSoulIOSession>,
+) -> Result<SendableWriter> {
+    let io_config = io_session.io_config();
+    let file_path = io_config
+        .files
+        .last()
+        .ok_or(report!("wrong number of file names provided for writer"))?
+        .clone();
+    let physical_format = io_config.physical_format()?;
+    let file_schema = file_schema_from_io_config(io_config)?;
+    let table_path = ListingTableUrl::parse(&file_path)?;
+
+    let sink_config = FileSinkConfig {
+        original_url: file_path,
+        object_store_url: table_path.object_store(),
+        file_group: FileGroup::default(),
+        table_paths: vec![table_path],
+        output_schema: file_schema.clone(),
+        table_partition_cols: vec![], // already cleaned by parent writer
+        insert_op: InsertOp::Append,
+        keep_partition_by_columns: false,
+        file_extension: physical_format.extension().to_string(),
+        file_output_mode: FileOutputMode::SingleFile,
+    };
+
+    // TODO(jiax): expose vortex write options
+    let sink: Arc<dyn FileSink> = match physical_format {
+        PhysicalFormat::Parquet => {
+            Arc::new(ParquetSink::new(sink_config, parquet_options(io_config)))
+        }
+        PhysicalFormat::Vortex => Arc::new(VortexSink::new(
+            sink_config,
+            file_schema,
+            VortexSession::default().with_tokio(),
+        )),
+    };
+
+    Ok(Box::new(FileSinkWriter::try_new(
+        sink,
+        physical_format,
+        io_session,
+    )?))
+}
+
+fn file_schema_from_io_config(io_config: &LakeSoulIOConfig) -> Result<SchemaRef> {
+    let schema = uniform_schema(io_config.target_schema.0.clone());
+    let range_partitions = io_config.range_partitions_slice();
+
+    if range_partitions.is_empty() {
+        return Ok(schema);
+    }
+
+    let mut projection = Vec::new();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if !range_partitions.contains(field.name()) {
+            projection.push(idx);
+        }
+    }
+
+    Ok(Arc::new(schema.project(&projection)?))
+}
+
+fn parquet_options(io_config: &LakeSoulIOConfig) -> TableParquetOptions {
+    let mut options = TableParquetOptions::default();
+    let field_count = uniform_schema(io_config.target_schema.0.clone())
+        .fields()
+        .len()
+        .max(1);
+    let max_row_group_size = if io_config.max_row_group_size * field_count
+        > io_config.max_row_group_num_values
+    {
+        io_config
+            .batch_size
+            .max(io_config.max_row_group_num_values / field_count)
+    } else {
+        io_config.max_row_group_size
+    };
+
+    options.global.write_batch_size = io_config.batch_size;
+    options.global.max_row_group_size = max_row_group_size;
+    options.global.compression = Some("zstd(1)".to_string());
+    options.global.dictionary_enabled = Some(false);
+    options
 }
 
 /// Used by FFI
@@ -139,7 +248,6 @@ pub struct SyncSendableMutableLakeSoulWriter {
     /// The in-progress file writer if any
     in_progress: Option<Arc<Mutex<SendableWriter>>>,
     flush_results: Vec<FlushOutput>,
-    lsh_computers: HashMap<String, LSH>,
 }
 
 impl SyncSendableMutableLakeSoulWriter {
@@ -153,44 +261,6 @@ impl SyncSendableMutableLakeSoulWriter {
         let runtime = Arc::new(runtime);
         runtime.clone().block_on(async move {
             let mut new_io_config = io_session.io_config().clone();
-
-            // Initialize HashMap instead of Vec
-            let mut lsh_computers = HashMap::new();
-
-            if new_io_config.compute_lsh() {
-                let mut target_schema_builder =
-                    SchemaBuilder::from(&new_io_config.target_schema().fields);
-
-                for field in new_io_config.target_schema().fields.iter() {
-                    if let Some(lsh_bit_width) = field.metadata().get("lsh_bit_width") {
-                        let lsh_column_name = format!("{}_LSH", field.name());
-                        let lsh_column = Arc::new(Field::new(
-                            lsh_column_name.clone(),
-                            DataType::List(Arc::new(Field::new(
-                                "element",
-                                DataType::Int64,
-                                true,
-                            ))),
-                            true,
-                        ));
-                        target_schema_builder.try_merge(&lsh_column)?;
-
-                        // Store LSH computer with column name as key
-                        let lsh = LSH::new(
-                            lsh_bit_width.parse().unwrap(),
-                            field
-                                .metadata()
-                                .get("lsh_embedding_dimension")
-                                .map(|d| d.parse().unwrap())
-                                .unwrap_or(0),
-                            new_io_config.seed,
-                        );
-                        lsh_computers.insert(field.name().to_string(), lsh);
-                    }
-                }
-                new_io_config.target_schema =
-                    IOSchema(Arc::new(target_schema_builder.finish()));
-            }
 
             let writer = create_writer(io_session.clone()).await?;
             let schema = writer.schema();
@@ -208,7 +278,6 @@ impl SyncSendableMutableLakeSoulWriter {
                 schema,
                 io_session: Arc::new(io_session.with_io_config(new_io_config)),
                 flush_results: vec![],
-                lsh_computers,
             })
         })
     }
@@ -232,39 +301,6 @@ impl SyncSendableMutableLakeSoulWriter {
             runtime.block_on(
                 async move { self.write_batch_async(record_batch, false).await },
             )
-        } else if self.io_config().compute_lsh() {
-            debug!("batch schema: {}", record_batch.schema());
-
-            let mut new_columns = record_batch.columns().to_vec();
-
-            for (field_name, lsh_computer) in self.lsh_computers.iter() {
-                let lsh_column_name = format!("{}_LSH", field_name);
-
-                if let Some(array) = record_batch.column_by_name(field_name) {
-                    let embedding =
-                        array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                            report!("Column {} is not a ListArray", field_name)
-                        })?;
-
-                    let lsh_array = lsh_computer.compute_lsh(&Some(embedding.clone()))?;
-
-                    if let Ok(index) =
-                        record_batch.schema().index_of(lsh_column_name.as_str())
-                    {
-                        new_columns[index] = Arc::new(lsh_array);
-                    }
-                }
-            }
-
-            debug!("target schema: {}", self.io_config().target_schema());
-            debug!("new cols len: {}", new_columns.len());
-
-            let new_record_batch =
-                RecordBatch::try_new(self.io_config().target_schema(), new_columns)?;
-
-            runtime.block_on(async move {
-                self.write_batch_async(new_record_batch, false).await
-            })
         } else {
             runtime.block_on(
                 async move { self.write_batch_async(record_batch, false).await },
@@ -331,55 +367,65 @@ impl SyncSendableMutableLakeSoulWriter {
         }
     }
 
+    /// Flush all pending data and return the files produced by this writer.
     #[instrument(skip(self), err)]
-    pub fn flush_and_close(self) -> Result<Vec<u8>> {
-        if let Some(inner_writer) = self.in_progress {
+    pub fn finish(self) -> Result<Vec<FlushOutput>> {
+        let Self {
+            runtime,
+            in_progress,
+            mut flush_results,
+            ..
+        } = self;
+
+        if let Some(inner_writer) = in_progress {
             let inner_writer = match Arc::try_unwrap(inner_writer) {
                 Ok(inner) => inner,
                 Err(_) => {
                     bail!("Cannot get ownership of the inner writer");
                 }
             };
-            let runtime = self.runtime;
             runtime.block_on(async move {
                 let writer = inner_writer.into_inner();
-
-                let mut grouped_results: HashMap<String, Vec<String>> = HashMap::new();
                 let results = writer.flush_and_close().await?;
-                for FlushOutput {
-                    partition_desc,
-                    file_path,
-                    object_meta,
-                    file_meta,
-                } in self.flush_results.into_iter().chain(results)
-                {
-                    let encoded = format!(
-                        "{}\x03{}\x03{}",
-                        file_path,
-                        object_meta.size,
-                        get_file_exist_col(&file_meta)
-                    );
-                    match grouped_results.get_mut(&partition_desc) {
-                        Some(files) => {
-                            files.push(encoded);
-                        }
-                        None => {
-                            grouped_results.insert(partition_desc, vec![encoded]);
-                        }
-                    }
-                }
-                let mut summary = format!("{}", grouped_results.len());
-                for (partition_desc, files) in grouped_results.iter() {
-                    summary += "\x01";
-                    summary += partition_desc.as_str();
-                    summary += "\x02";
-                    summary += files.join("\x02").as_str();
-                }
-                Ok(summary.into_bytes())
+                flush_results.extend(results);
+                Ok(flush_results)
             })
         } else {
-            Ok(vec![])
+            Ok(flush_results)
         }
+    }
+
+    #[instrument(skip(self), err)]
+    pub fn flush_and_close(self) -> Result<Vec<u8>> {
+        let mut grouped_results: HashMap<String, Vec<String>> = HashMap::new();
+        for FlushOutput {
+            partition_desc,
+            file_path,
+            object_meta,
+            file_exist_cols,
+            ..
+        } in self.finish()?
+        {
+            let encoded = format!(
+                "{}\x03{}\x03{}",
+                file_path,
+                object_meta.size,
+                file_exist_cols.join(",")
+            );
+            grouped_results
+                .entry(partition_desc)
+                .or_default()
+                .push(encoded);
+        }
+
+        let mut summary = format!("{}", grouped_results.len());
+        for (partition_desc, files) in grouped_results {
+            summary += "\x01";
+            summary += partition_desc.as_str();
+            summary += "\x02";
+            summary += files.join("\x02").as_str();
+        }
+        Ok(summary.into_bytes())
     }
 
     #[instrument(skip(self), err)]
@@ -410,7 +456,9 @@ impl SyncSendableMutableLakeSoulWriter {
 mod tests {
     use crate::{
         Result,
-        config::{LakeSoulIOConfigBuilder, OPTION_KEY_MEM_LIMIT},
+        config::{
+            LakeSoulIOConfigBuilder, OPTION_KEY_MEM_LIMIT, OPTION_KEY_PHYSICAL_FORMAT,
+        },
     };
 
     use super::SortAsyncWriter;
@@ -451,10 +499,9 @@ mod tests {
                 .build();
 
             let io_session = Arc::new(LakeSoulIOSession::try_new(writer_io_config)?);
-            let mut async_writer =
-                MultiPartAsyncWriter::try_new(io_session.clone()).await?;
+            let mut async_writer = create_leaf_writer(io_session.clone())?;
             async_writer.write_record_batch(to_write.clone()).await?;
-            Box::new(async_writer).flush_and_close().await?;
+            async_writer.flush_and_close().await?;
 
             let file = File::open(path.clone())?;
             let mut record_batch_reader =
@@ -485,7 +532,7 @@ mod tests {
                 .build();
 
             let io_session = Arc::new(LakeSoulIOSession::try_new(writer_io_config)?);
-            let async_writer = MultiPartAsyncWriter::try_new(io_session.clone()).await?;
+            let async_writer = create_leaf_writer(io_session.clone())?;
             let mut async_writer =
                 SortAsyncWriter::try_new(async_writer, io_session.clone())?;
             async_writer.write_record_batch(to_write.clone()).await?;
@@ -511,6 +558,43 @@ mod tests {
 
                 assert_eq!(expected_data, actual_data);
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_vortex_file_sink_write() -> Result<()> {
+        let runtime = Arc::new(Builder::new_multi_thread().enable_all().build().unwrap());
+        runtime.clone().block_on(async move {
+            let col = Arc::new(Int64Array::from_iter_values([3, 2, 1])) as ArrayRef;
+            let to_write = RecordBatch::try_from_iter([("col", col)])?;
+            let temp_dir = tempfile::tempdir()?;
+            let path = temp_dir
+                .path()
+                .join("test.vortex")
+                .into_os_string()
+                .into_string()
+                .unwrap();
+            let writer_io_config = LakeSoulIOConfigBuilder::new()
+                .with_files(vec![path.clone()])
+                .with_thread_num(2)
+                .with_batch_size(256)
+                .with_schema(to_write.schema())
+                .build();
+
+            let io_session = Arc::new(LakeSoulIOSession::try_new(writer_io_config)?);
+            let mut async_writer = create_leaf_writer(io_session.clone())?;
+            async_writer.write_record_batch(to_write.clone()).await?;
+            let outputs = async_writer.flush_and_close().await?;
+
+            assert_eq!(outputs.len(), 1);
+            assert!(outputs[0].file_path.ends_with(&path));
+            assert_eq!(outputs[0].row_count, to_write.num_rows());
+            assert_eq!(
+                outputs[0].other_info.get("physical_format"),
+                Some(&"vortex".to_string())
+            );
+            assert!(std::fs::metadata(path)?.len() > 0);
             Ok(())
         })
     }
@@ -745,7 +829,7 @@ mod tests {
     fn test_writer_with_complex_pk_types() -> Result<()> {
         let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
 
-        // 创建测试数据
+        // create test data
         let id1 = Arc::new(
             Decimal128Array::from_iter_values([
                 123456000, // 1234.56000
@@ -815,6 +899,7 @@ mod tests {
             .with_hash_bucket_num("2".to_string())
             .set_dynamic_partition(true)
             .with_option(OPTION_KEY_MEM_LIMIT, format!("{}", 1024 * 1024 * 50))
+            .with_option(OPTION_KEY_PHYSICAL_FORMAT, "parquet")
             .build();
 
         let io_session = Arc::new(LakeSoulIOSession::try_new(writer_io_config)?);
@@ -822,11 +907,7 @@ mod tests {
         writer.write_batch(to_write.clone())?;
         let result = writer.flush_and_close()?;
 
-        println!("result: {:?}", result);
-
-        // 验证结果不为空
         assert!(result.len() > 1);
-
         Ok(())
     }
 }

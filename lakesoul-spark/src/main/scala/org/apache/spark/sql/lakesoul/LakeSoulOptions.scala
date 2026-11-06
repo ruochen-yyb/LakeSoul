@@ -114,6 +114,7 @@ object LakeSoulOptions {
   val RANGE_PARTITIONS = "rangePartitions"
   val HASH_PARTITIONS = "hashPartitions"
   val HASH_BUCKET_NUM = "hashBucketNum"
+  val FILE_FORMAT = "file_format"
 
   val SHORT_TABLE_NAME = "shortTableName"
 
@@ -131,11 +132,5 @@ object LakeSoulOptions {
     val FULL_READ = "fullread"
     val SNAPSHOT_READ = "snapshot"
     val INCREMENTAL_READ = "incremental"
-  }
-
-  object SchemaFieldMetadata {
-    val LSH_EMBEDDING_DIMENSION = "lsh_embedding_dimension"
-    val LSH_BIT_WIDTH = "lsh_bit_width"
-    val LSH_RNG_SEED = "lsh_rng_seed"
   }
 }

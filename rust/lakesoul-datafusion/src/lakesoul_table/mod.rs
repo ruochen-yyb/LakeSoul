@@ -19,9 +19,9 @@ use datafusion::{
     execution::context::{SessionContext, SessionState},
     logical_expr::LogicalPlanBuilder,
 };
-use helpers::case_fold_table_name;
+use helpers::{case_fold_table_name, create_io_config_builder_from_table_info};
 use lakesoul_io::config::OPTION_KEY_MEM_LIMIT;
-use lakesoul_io::helpers::get_file_exist_col;
+use lakesoul_io::file_format::LakeSoulFormatRegistry;
 use lakesoul_io::session::create_session_context_with_planner;
 use lakesoul_io::writer::async_writer::{
     AsyncBatchWriter, AsyncSendableMutableLakeSoulWriter, FlushOutput,
@@ -34,7 +34,6 @@ use uuid::Uuid;
 
 use crate::datasource::file_format::LakeSoulMetaDataParquetFormat;
 use crate::datasource::table_provider::LakeSoulTableProvider;
-use crate::serialize::arrow_java::schema_from_metadata_str;
 use crate::{
     Result,
     catalog::{
@@ -42,6 +41,7 @@ use crate::{
     },
     planner::query_planner::LakeSoulQueryPlanner,
 };
+use lakesoul_common::ser::arrow_java::schema_from_table_info_metadata;
 
 pub mod helpers;
 
@@ -114,7 +114,11 @@ impl LakeSoulTable {
         client: MetaDataClientRef,
         table_info: TableInfo,
     ) -> Result<Self> {
-        let table_schema = schema_from_metadata_str(&table_info.table_schema);
+        let table_schema = Arc::new(schema_from_table_info_metadata(
+            &table_info.table_schema,
+            &table_info.table_schema_arrow_ipc,
+            &table_info.table_schema_arrow_ipc_json_hash,
+        )?);
 
         let table_name = table_info.table_name.clone();
         let properties =
@@ -299,17 +303,29 @@ impl LakeSoulTable {
         &self,
         pushdown_filters: bool,
     ) -> Result<Arc<dyn TableProvider>> {
+        let io_config = create_io_config_builder_from_table_info(
+            self.table_info(),
+            HashMap::new(),
+            HashMap::new(),
+        )?
+        .build();
+        let format_registry =
+            Arc::new(LakeSoulFormatRegistry::new(io_config.clone(), false)?);
+
         Ok(Arc::new(LakeSoulTableProvider {
             listing_options: LakeSoulMetaDataParquetFormat::default_listing_options()
                 .await?,
             listing_table_paths: vec![],
             client: self.client(),
             table_info: self.table_info(),
-            table_schema: self.schema(),
+            logical_schema: self.schema(),
+            scan_schema: self.schema(),
             file_schema: self.schema(),
             primary_keys: self.primary_keys().to_vec(),
             range_partitions: self.range_partitions().to_vec(),
             pushdown_filters,
+            io_config,
+            format_registry,
         }))
     }
 
@@ -420,12 +436,10 @@ fn partitioned_files_from_writer_flush_result(
     let mut partition_desc_and_files_map = HashMap::new();
 
     for output in flush_result {
-        let file_exist_cols = get_file_exist_col(&output.file_meta);
-
         let flush_result = FlushResult {
             file_path: output.file_path.clone(),
             file_size: output.object_meta.size as i64,
-            file_exist_cols,
+            file_exist_cols: output.file_exist_cols.join(","),
         };
 
         partition_desc_and_files_map

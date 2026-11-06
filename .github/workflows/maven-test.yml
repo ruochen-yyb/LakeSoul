@@ -36,13 +36,13 @@ jobs:
             - name: Free Disk Space (Ubuntu)
               uses: jlumbroso/free-disk-space@main
               with:
-                tool-cache: false
-                android: true
-                dotnet: true
-                haskell: true
-                large-packages: false
-                docker-images: true
-                swap-storage: true
+                  tool-cache: false
+                  android: true
+                  dotnet: true
+                  haskell: true
+                  large-packages: false
+                  docker-images: true
+                  swap-storage: true
             - uses: actions/checkout@v4
             - name: Set up JDK 11
               uses: actions/setup-java@v4
@@ -50,11 +50,9 @@ jobs:
                   java-version: "11"
                   distribution: "temurin"
                   cache: maven
-            - uses: actions-rs/toolchain@v1
+            - uses: dtolnay/rust-toolchain@master
               with:
-                  profile: minimal
                   toolchain: stable
-                  default: true
             - uses: Swatinem/rust-cache@v2
               with:
                   workspaces: ". -> rust/target"
@@ -196,6 +194,7 @@ jobs:
                   path: ./rust/target/release/
             - name: Build with Maven
               run: |
+                  export LAKESOUL_IO_USE_V2_MERGE=true
                   mvn -B clean test -pl lakesoul-spark -am -Pcross-build -Pparallel-test --file pom.xml -Dtest='!ANNCase,!UpdateScalaSuite,!AlterTableByNameSuite,!ReadSuite,!UpdateSQLSuite,!ParquetNativeFilterSuite,!DeleteScalaSuite,!DeleteSQLSuite,!ParquetV2FilterSuite,!ParquetScanSuite,!UpsertSuiteBase,!RBACOperationSuite,!DeltaJoinSuite' -Dsurefire.failIfNoSpecifiedTests=false
             - name: Generate Report Site
               if: always()
@@ -265,10 +264,10 @@ jobs:
             - name: Build with Maven
               run: |
                   sudo apt-get update && sudo apt-get install --only-upgrade tzdata
-                  wget -q https://dmetasoul-bucket.obs.cn-southwest-2.myhuaweicloud.com/releases/lakesoul/gluten-maven-deps-1.6.0.tar.gz
+                  wget -q https://dmetasoul-bucket.obs.cn-southwest-2.myhuaweicloud.com/releases/lakesoul/gluten-maven-deps-1.6.0-spark35.tar.gz
                   mkdir -p ~/.m2/repository
-                  tar xf gluten-maven-deps-1.6.0.tar.gz -C ~/.m2/repository
-                  rm -f gluten-maven-deps-1.6.0.tar.gz
+                  tar xf gluten-maven-deps-1.6.0-spark35.tar.gz -C ~/.m2/repository
+                  rm -f gluten-maven-deps-1.6.0-spark35.tar.gz
                   export RUST_LOG=info
                   export LAKESOUL_IO_USE_V2_MERGE=true
                   MAVEN_OPTS="-Xmx4g -Dio.netty.tryReflectionSetAccessible=true" mvn -B clean test -pl lakesoul-spark-gluten -am -Pgluten -Pcross-build --file pom.xml -Dtest='LakeSoulGlutenCompatSuite,UpdateGlutenTestSuite,UpsertGlutenTestSuite,DeleteSQLGlutenTestSuite,MergeIntoSQLGlutenTestSuite,' -Dsurefire.failIfNoSpecifiedTests=false
@@ -432,7 +431,7 @@ jobs:
               uses: actions/upload-artifact@v4
               with:
                   name: maven-test-report-artifact-flink-1
-                  path: lakesoul-flink/target/site
+                  path: lakesoul-flink/target/reports
                   retention-days: 5
                   if-no-files-found: error
 

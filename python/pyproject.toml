@@ -4,14 +4,14 @@
 
 [project]
 name = "lakesoul"
-version = "1.1.0"
+version = "1.2.0.dev0"
 authors = [
   { name = "LakeSoul Team", email = "lakesoul-technical-discuss@lists.lfaidata.foundation" },
 ]
 description = "Python APIs for using LakeSoul"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["lakesoul", "bigdata", "ai"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
@@ -36,15 +36,17 @@ exclude = ["script/lakesoul-e2e"]
 torch = ["torch>=1.11.0,<2.5"]
 pandas = ["pandas>=1.4"]
 datasets = ["datasets>=2.20"]
-ray = ["ray>=2.7,<2.11.0"]
-pyspark = ["pyspark==3.3.1"]
+ray = ["ray>=2.55,<2.56"]
+daft = ["daft>=0.7.15"]
+pyspark = ["pyspark==3.5.8"]
 duckdb = ["duckdb>=1.4.0"]
 all = [
   "torch>=1.11,<2.5",
   "pandas>=1.4",
   "datasets>=2.20",
-  "ray>=2.7,<2.11.0",
-  "pyspark==3.3.1",
+  "ray>=2.55,<2.56",
+  "daft>=0.7.15",
+  "pyspark==3.5.8",
   "duckdb>=1.4.0",
 ]
 
@@ -62,8 +64,9 @@ all = [
   "torch>=1.11,<2.5",
   "pandas>=1.4",
   "datasets>=2.14",
-  "ray>=2.7,<2.11.0",
-  "pyspark==3.3.1",
+  "ray>=2.55,<2.56",
+  "daft>=0.7.15",
+  "pyspark==3.5.8",
   "grpcio-tools == 1.70",
   "duckdb",
 ]
@@ -84,14 +87,19 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
-
-[[tool.uv.index]]
-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-default = true
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
 
 [tool.ruff]
 line-length = 88
-
+exclude = [
+    "src/lakesoul/metadata/generated/*.py",
+    "src/lakesoul/metadata/generated/*.pyi"
+]
 
 [tool.basedpyright]
 typeCheckingMode = "standard"
+
+[tool.ty.src]
+exclude = ["src/lakesoul/metadata/generated"]

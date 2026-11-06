@@ -23,7 +23,7 @@ use arrow::array::{
 };
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::SortOptions;
-use arrow::datatypes::ArrowNativeTypeOp;
+use arrow::datatypes::{ArrowNativeTypeOp, DataType};
 use arrow::row::{RowConverter, Rows};
 use atomic_refcell::AtomicRefCell;
 use datafusion::execution::memory_pool::MemoryReservation;
@@ -218,7 +218,7 @@ impl CursorValues for RowValues {
             let row = borrowed.row(offset);
             let mut new_rows = self.row_converter.empty_rows(1, row.data().len());
             new_rows.push(row);
-            let mut rows_reservation = self._reservation.new_empty();
+            let rows_reservation = self._reservation.new_empty();
             rows_reservation.try_grow(new_rows.size()).unwrap();
             RowValues::new(new_rows, self.row_converter.clone(), rows_reservation)
         } else {
@@ -231,7 +231,7 @@ impl CursorValues for RowValues {
                 let new_rows = self.row_converter.from_binary(sliced);
                 let old_rows = self.row_converter.from_binary(binary_array);
                 let _ = std::mem::replace(old_rows_ref, old_rows);
-                let mut rows_reservation = self._reservation.new_empty();
+                let rows_reservation = self._reservation.new_empty();
                 rows_reservation.try_grow(new_rows.size()).unwrap();
                 RowValues::new(new_rows, self.row_converter.clone(), rows_reservation)
             }
@@ -243,11 +243,17 @@ impl CursorValues for RowValues {
 pub trait CursorArray: Array + 'static {
     type Values: CursorValues;
 
+    fn data_type() -> DataType;
+
     fn values(&self) -> Self::Values;
 }
 
 impl<T: ArrowPrimitiveType> CursorArray for PrimitiveArray<T> {
     type Values = PrimitiveValues<T::Native>;
+
+    fn data_type() -> DataType {
+        T::DATA_TYPE
+    }
 
     fn values(&self) -> Self::Values {
         PrimitiveValues(self.values().clone())
@@ -326,6 +332,10 @@ impl<T: OffsetSizeTrait> CursorValues for ByteArrayValues<T> {
 impl<T: ByteArrayType> CursorArray for GenericByteArray<T> {
     type Values = ByteArrayValues<T::Offset>;
 
+    fn data_type() -> DataType {
+        T::DATA_TYPE
+    }
+
     fn values(&self) -> Self::Values {
         ByteArrayValues {
             offsets: self.offsets().clone(),
@@ -336,6 +346,11 @@ impl<T: ByteArrayType> CursorArray for GenericByteArray<T> {
 
 impl CursorArray for StringViewArray {
     type Values = StringViewArray;
+
+    fn data_type() -> DataType {
+        DataType::Utf8View
+    }
+
     fn values(&self) -> Self {
         self.gc()
     }

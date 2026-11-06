@@ -25,28 +25,34 @@ docker exec -i lakesoul-test-pg sh -c "PGPASSWORD=lakesoul_test psql -h localhos
 ```
 
 ### 1.3 安装 Spark 环境
-由于 Apache Spark 官方的下载安装包不包含 hadoop-cloud 以及 AWS S3 等依赖，我们提供了一个 Spark 安装包，其中包含了 hadoop cloud 、s3 等必要的依赖：https://dmetasoul-bucket.obs.cn-southwest-2.myhuaweicloud.com/releases/spark/spark-3.3.2-bin-hadoop3.tgz
-
 ```bash
-wget https://dmetasoul-bucket.obs.cn-southwest-2.myhuaweicloud.com/releases/spark/spark-3.3.2-bin-hadoop3.tgz
-tar xf spark-3.3.2-bin-hadoop3.tgz
-export SPARK_HOME=${PWD}/spark-3.3.2-bin-hadoop3
+wget https://dlcdn.apache.org/spark/spark-3.5.8/spark-3.5.8-bin-hadoop3.tgz
+tar xf spark-3.5.8-bin-hadoop3.tgz
+export SPARK_HOME=${PWD}/spark-3.5.8-bin-hadoop3
 ```
+
+:::tip
+Spark 的官方包里没有打包 AWS S3 的依赖，需要额外下载：
+```bash
+RUN curl -L -o $SPARK_HOME/jars/hadoop-aws-3.3.4.jar https://dmetasoul-bucket.obs.cn-southwest-2.myhuaweicloud.com/releases/lakesoul/hadoop-aws-3.3.4.jar || exit 1
+RUN curl -L -o $SPARK_HOME/jars/aws-java-sdk-bundle-1.12.776.jar https://repo.huaweicloud.com/repository/maven/com/amazonaws/aws-java-sdk-bundle/1.12.776/aws-java-sdk-bundle-1.12.776.jar || exit 1
+```
+:::
 
 :::tip
 如果是生产部署，推荐下载不打包 Hadoop 的 Spark 安装包：
 
-https://dlcdn.apache.org/spark/spark-3.3.2/spark-3.3.2-bin-without-hadoop.tgz
+https://dlcdn.apache.org/spark/spark-3.5.8/spark-3.5.8-bin-without-hadoop.tgz
 
 并参考 https://spark.apache.org/docs/latest/hadoop-provided.html 这篇文档使用集群环境中的 Hadoop 依赖和配置。
 :::
 
 LakeSoul 发布 jar 包可以从 GitHub Releases 页面下载：https://github.com/lakesoul-io/LakeSoul/releases 。下载后请将 Jar 包放到 Spark 安装目录下的 jars 目录中：
 ```bash
-wget https://github.com/lakesoul-io/LakeSoul/releases/download/vVAR::VERSION/lakesoul-spark-3.3-VAR::VERSION.jar -P $SPARK_HOME/jars
+wget https://github.com/lakesoul-io/LakeSoul/releases/download/vVAR::VERSION/lakesoul-spark-3.5-VAR::VERSION.jar -P $SPARK_HOME/jars
 ```
 
-如果访问 Github 有问题，也可以从如下链接下载：https://mirrors.huaweicloud.com/repository/maven/com/dmetasoul/lakesoul-spark/3.3-VAR::VERSION/lakesoul-spark-3.3-VAR::VERSION.jar
+如果访问 Github 有问题，也可以从如下链接下载：https://mirrors.huaweicloud.com/repository/maven/com/dmetasoul/lakesoul-spark/3.5-VAR::VERSION/lakesoul-spark-3.5-VAR::VERSION.jar
 
 :::tip
 从 2.1.0 版本起，LakeSoul 自身的依赖已经通过 shade 方式打包到一个 jar 包中。之前的版本是多个 jar 包以 tar.gz 压缩包的形式发布。
@@ -81,7 +87,7 @@ export lakesoul_home=/opt/soft/pg.property
   ./bin/spark-shell --conf spark.sql.extensions=com.dmetasoul.lakesoul.sql.LakeSoulSparkSessionExtension --conf spark.sql.catalog.lakesoul=org.apache.spark.sql.lakesoul.catalog.LakeSoulCatalog --conf spark.sql.defaultCatalog=lakesoul --conf spark.hadoop.fs.s3a.access.key=XXXXXX --conf spark.hadoop.fs.s3a.secret.key=XXXXXX --conf spark.hadoop.fs.s3a.endpoint=XXXXXX --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
   ```
 
-如果是 Minio 等兼容 S3 的存储服务，还需要添加 `--conf spark.hadoop.fs.s3a.path.style.access=true`。
+如果是 RustFS 等兼容 S3 的存储服务，还需要添加 `--conf spark.hadoop.fs.s3a.path.style.access=true`。
 
 #### Spark 作业 LakeSoul 相关参数设置
 可以将以下配置添加到 spark-defaults.conf 或者 Spark Session Builder 部分。
@@ -117,7 +123,7 @@ s3.access-key: XXXXXX
 s3.secret-key: XXXXXX
 s3.endpoint: XXXXXX
 ```
-如果是 Minio 等兼容 S3 的存储服务，还需要添加：
+如果是 RustFS 等兼容 S3 的存储服务，还需要添加：
 ```yaml
 s3.path.style.access: true
 ```
@@ -166,7 +172,7 @@ containerized.taskmanager.env.LAKESOUL_PG_URL: jdbc:postgresql://127.0.0.1:5432/
 :::
 
 ### 2.3 在客户端机器上配置全局环境变量信息
-这里需要用到变量信息写到一个 env.sh 文件中，这里 Hadoop 版本为 3.1.4.0-315，Spark 版本为 spark-3.3.2， Flink 版本为 flink-1.20.1，Hadoop 环境可以根据实际情况配置。如果客户机上已经有默认的 Hadoop 环境变量配置，则前面 Hadoop 的变量可以省去：
+这里需要用到变量信息写到一个 env.sh 文件中，这里 Hadoop 版本为 3.1.4.0-315，Spark 版本为 spark-3.5.8， Flink 版本为 flink-1.20.1，Hadoop 环境可以根据实际情况配置。如果客户机上已经有默认的 Hadoop 环境变量配置，则前面 Hadoop 的变量可以省去：
 ```shell
 export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 export HADOOP_HOME="/usr/hdp/3.1.4.0-315/hadoop"
@@ -176,7 +182,7 @@ export HADOOP_YARN_HOME="/usr/hdp/3.1.4.0-315/hadoop-yarn"
 export HADOOP_LIBEXEC_DIR="/usr/hdp/3.1.4.0-315/hadoop/libexec"
 export HADOOP_CONF_DIR="/usr/hdp/3.1.4.0-315/hadoop/conf"
 
-export SPARK_HOME=/usr/hdp/spark-3.3.2-bin-without-hadoop-ddf
+export SPARK_HOME=/usr/hdp/spark-3.5.8-bin-without-hadoop
 export SPARK_CONF_DIR=/home/lakesoul/lakesoul_hadoop_ci/LakeSoul-main/LakeSoul/script/benchmark/hadoop/spark-conf
 
 export FLINK_HOME=/opt/flink-1.20.1
@@ -197,7 +203,7 @@ source env.sh
 ## 3. 使用 Docker Compose 搭建本地集群环境
 
 ### 3.1 Docker Compose 文件
-我们提供了 docker compose 环境方便快速启动一个本地的 PostgreSQL 服务和一个 MinIO S3 存储服务。Docker Compose 环境可以在代码库中找到：[lakesoul-docker-compose-env](https://github.com/lakesoul-io/LakeSoul/tree/main/docker/lakesoul-docker-compose-env).
+我们提供了 docker compose 环境方便快速启动一个本地的 PostgreSQL 服务和一个 RustFS S3 存储服务。Docker Compose 环境可以在代码库中找到：[lakesoul-docker-compose-env](https://github.com/lakesoul-io/LakeSoul/tree/main/docker/lakesoul-docker-compose-env).
 
 ### 3.2 安装 Docker Compose
 安装 Docker Compose 可以参考 Docker 官方文档：[Install Docker Engine](https://docs.docker.com/engine/install/)
@@ -208,7 +214,7 @@ source env.sh
 cd docker/lakesoul-docker-compose-env/
 docker compose up -d
 ```
-然后可以使用 `docker compose ps` 命令来检查服务状态是否是 `running`. PostgreSQL 服务会自动初始化好 LakeSoul 需要的 database 和 表结构。MinIO 服务会创建一个公共读写的桶。PostgreSQL 的用户名、密码、DB名字、MinIO 的桶名可以在 `docker-compose.yml` 文件中修改。
+然后可以使用 `docker compose ps` 命令来检查服务状态是否是 `running`. PostgreSQL 服务会自动初始化好 LakeSoul 需要的 database 和 表结构。RustFS 服务会创建一个公共读写的桶。PostgreSQL 的用户名、密码、DB名字、RustFS 的桶名可以在 `docker-compose.yml` 文件中修改。
 
 ### 3.4 在 Docker Compose 环境中运行 LakeSoul 测试
 #### 3.4.1 准备 LakeSoul 配置文件
@@ -219,26 +225,28 @@ lakesoul.pg.username=lakesoul_test
 lakesoul.pg.password=lakesoul_test
 ```
 #### 3.4.2 准备 Spark 镜像
-可以使用 bitnami Spark 镜像：
+可以使用 Spark 镜像：
 ```bash
-docker pull swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/bitnami/spark:3.3.1
+docker pull swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/spark:3.5.8-py310-hadoop334
 ```
 
 #### 3.4.3 启动 Spark Shell
 ```bash
 docker run --net lakesoul-docker-compose-env_default --rm -ti \
     -v $(pwd)/lakesoul.properties:/opt/spark/work-dir/lakesoul.properties \
-    --env lakesoul_home=/opt/spark/work-dir/lakesoul.properties swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/bitnami/spark:3.3.1 \
+    --env lakesoul_home=/opt/spark/work-dir/lakesoul.properties swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/spark:3.5.8-py310-hadoop334 \
     spark-shell \
-    --packages com.dmetasoul:lakesoul-spark:2.4.0-spark-3.3 \
+    --packages com.dmetasoul:lakesoul-spark:3.5-3.0.0 \
     --conf spark.sql.extensions=com.dmetasoul.lakesoul.sql.LakeSoulSparkSessionExtension \
     --conf spark.sql.catalog.lakesoul=org.apache.spark.sql.lakesoul.catalog.LakeSoulCatalog \
     --conf spark.sql.defaultCatalog=lakesoul \
     --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
     --conf spark.hadoop.fs.s3a.buffer.dir=/opt/spark/work-dir/s3a \
     --conf spark.hadoop.fs.s3a.path.style.access=true \
-    --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
-    --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider
+    --conf spark.hadoop.fs.s3a.endpoint=http://rustfs:9000 \
+    --conf spark.hadoop.fs.s3a.endpoint.region=us-east-1 \
+    --conf spark.hadoop.fs.s3a.access.key=rustfsadmin \
+    --conf spark.hadoop.fs.s3a.secret.key=rustfsadmin
 ```
 
 #### 3.4.4 执行 LakeSoul Scala API
@@ -255,17 +263,17 @@ df.write
 ```
 
 #### 3.4.5 检查数据是否成功写入
-可以打开链接 http://127.0.0.1:9001/buckets/lakesoul-test-bucket/browse/ 查看数据是否已经成功写入。
-MinIO console 的登录用户名密码是 minioadmin1:minioadmin1。
+可以打开链接 http://127.0.0.1:9001/buckets/lakesoul-test-bucket/ 查看数据是否已经成功写入。
+RustFS console 的登录用户名密码是 rustfsadmin:rustfsadmin。
 
-### 3.5 清理元数据表和 MinIO 桶
+### 3.5 清理元数据表和 RustFS 桶
 清理元数据表内容:
 ```bash
 docker exec -ti lakesoul-docker-compose-env-lakesoul-meta-db-1 psql -h localhost -U lakesoul_test -d lakesoul_test -f /meta_cleanup.sql
 ```
-清理 MinIO 桶内容:
+清理 RustFS 桶内容:
 ```bash
-docker run --net lakesoul-docker-compose-env_default --rm -t swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/bitnami/spark:3.3.1 aws --no-sign-request --endpoint-url http://minio:9000 s3 rm --recursive s3://lakesoul-test-bucket/
+docker run --net lakesoul-docker-compose-env_default --rm -t -e AWS_ACCESS_KEY_ID=rustfsadmin -e AWS_SECRET_ACCESS_KEY=rustfsadmin -e AWS_DEFAULT_REGION=us-east-1 swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/spark:3.5.8-py310-hadoop334 aws --endpoint-url http://rustfs:9000 s3 rm --recursive s3://lakesoul-test-bucket/
 ```
 
 ### 3.6 停止 Docker Compose 环境

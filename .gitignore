@@ -23,6 +23,7 @@ dependency-reduced-pom.xml
 dependency-reduced-pom.xml
 /lakesoul-spark/spark-warehouse/
 /script/benchmark/work-dir/*.jar
+/script/benchmark/**/*.log
 *.DS_Store
 __pycache__/
 /cpp/build/
@@ -30,6 +31,8 @@ __pycache__/
 /python/lakesoul/.libs/
 /python/lakesoul/arrow/_lakesoul_dataset.so
 /python/pyarrow
+/rust/lakesoul-io/temp_dir/
+/rust/lakesoul-io/lakesoul_cache_dir/
 /rust/lakesoul-io-c/lakesoul_c_bindings.h
 /rust/lakesoul-io-java/target/
 /rust/lakesoul-io-java/.idea/
@@ -39,6 +42,7 @@ __pycache__/
 /python/build/
 /python/lakesoul.egg-info/
 /python/lakesoul/metadata/lib/liblakesoul_metadata_c.so
+/python/spark-warehouse/
 *.whl
 /wheelhouse/
 /rust/.idea
@@ -57,9 +61,39 @@ lakesoul-presto/bin
 lakesoul-spark-gluten/bin
 **/.envrc
 **/.zed
+/metastore_db/
 
 **/memory_profiling.png
 **/output.log
 **/.codex
 
 **/.mcp.json
+**/internal*
+
+
+**/.bloop
+.direnv/
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+compatibility-artifacts

@@ -2,14 +2,16 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
     catalog::{Session, TableProvider, memory::DataSourceExec},
     datasource::source::DataSource,
     physical_expr::EquivalenceProperties,
-    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
+    physical_plan::{
+        ExecutionPlan, projection::ProjectionExprs, stream::RecordBatchStreamAdapter,
+    },
 };
 use datafusion_common::Statistics;
 use datafusion_expr::{Expr, TableType};
@@ -38,10 +40,6 @@ impl DataSource for TpchSource {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn fmt_as(
         &self,
         _t: datafusion::physical_plan::DisplayFormatType,
@@ -67,10 +65,6 @@ impl DataSource for TpchSource {
         EquivalenceProperties::new(self.kind.schema())
     }
 
-    fn statistics(&self) -> datafusion_common::Result<datafusion::common::Statistics> {
-        Ok(Statistics::new_unknown(&self.kind.schema()))
-    }
-
     fn with_fetch(
         &self,
         _limit: Option<usize>,
@@ -88,7 +82,7 @@ impl DataSource for TpchSource {
 
     fn try_swapping_with_projection(
         &self,
-        _projection: &[datafusion::physical_plan::projection::ProjectionExpr],
+        _projection: &ProjectionExprs,
     ) -> datafusion_common::Result<Option<Arc<dyn DataSource>>> {
         Ok(None)
     }
@@ -96,17 +90,13 @@ impl DataSource for TpchSource {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion_common::Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.kind.schema()))
+    ) -> datafusion_common::Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.kind.schema())))
     }
 }
 
 #[async_trait::async_trait]
 impl TableProvider for TpchSource {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.kind.schema()
     }

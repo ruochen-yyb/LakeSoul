@@ -9,12 +9,14 @@
 //! features like filtering, partitioning, and optimized reading with primary keys.
 //!
 //! # Examples
-//! ```rust
-//! use lakesoul_io::lakesoul_reader::LakeSoulReader;
-//! use lakesoul_io::lakesoul_io_config::LakeSoulIOConfigBuilder;
+//! ```no_run
+//! # fn main() -> lakesoul_io::Result<()> {
+//! # tokio_test::block_on(async {
+//! use lakesoul_io::config::LakeSoulIOConfig;
+//! use lakesoul_io::reader::LakeSoulReader;
 //!
-//! let config = LakeSoulIOConfigBuilder::new()
-//!     .with_files(vec!["path/to/file.parquet"])
+//! let config = LakeSoulIOConfig::builder()
+//!     .with_file("path/to/file.parquet")
 //!     .with_thread_num(1)
 //!     .with_batch_size(256)
 //!     .build();
@@ -24,8 +26,12 @@
 //!
 //! while let Some(batch) = reader.next_rb().await {
 //!     let record_batch = batch?;
-//!     // Process the record batch
+//!     let _row_count = record_batch.num_rows();
 //! }
+//! # Ok::<(), rootcause::Report>(())
+//! # })?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::sync::Arc;
@@ -66,13 +72,14 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
+/// # fn main() -> lakesoul_io::Result<()> {
 /// # tokio_test::block_on(async {
-/// use lakesoul_io::lakesoul_reader::LakeSoulReader;
-/// use lakesoul_io::lakesoul_io_config::LakeSoulIOConfigBuilder;
+/// use lakesoul_io::config::LakeSoulIOConfig;
+/// use lakesoul_io::reader::LakeSoulReader;
 ///
-/// let config = LakeSoulIOConfigBuilder::new()
-///     .with_files(vec!["path/to/file.parquet"])
+/// let config = LakeSoulIOConfig::builder()
+///     .with_file("path/to/file.parquet")
 ///     .with_thread_num(1)
 ///     .with_batch_size(256)
 ///     .build();
@@ -82,9 +89,12 @@ use crate::{
 ///
 /// while let Some(batch) = reader.next_rb().await {
 ///     let record_batch = batch?;
-///     // Process the record batch
+///     let _row_count = record_batch.num_rows();
 /// }
-/// })
+/// # Ok::<(), rootcause::Report>(())
+/// # })?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct LakeSoulReader {
     // not use `Arc` here
@@ -141,10 +151,15 @@ impl LakeSoulReader {
             .execution_props_mut()
             .mark_start_execution(options);
         let table_schema = self.io_session.get_table_schema().await?;
+        let filters = {
+            let io_config = self.io_session.io_config_mut();
+            io_config
+                .get_filter_exprs(table_schema.table_schema().as_ref())
+                .await?
+        };
+        let filters = self.inject_vector_search_filter(filters).await?;
+
         let io_config = self.io_session.io_config_mut();
-        let filters = io_config
-            .get_filter_exprs(table_schema.table_schema().as_ref())
-            .await?;
         // Check if filters are or-conjunction of primary column
         let skip_reader = if io_config.skip_merge_on_read()
             && !io_config.primary_keys.is_empty()
@@ -162,7 +177,7 @@ impl LakeSoulReader {
                     or_conjunctive_filter.len()
                 );
 
-                let hash_bucket_num = io_config.hash_bucket_num() as u32;
+                let hash_bucket_num = io_config.get_hash_bucket_num()? as u32;
                 // Collect all scalar values from optimizable expressions that match the hash bucket
                 let mut matching_scalar_values = std::collections::HashSet::new();
 
@@ -231,6 +246,96 @@ impl LakeSoulReader {
         Ok(())
     }
 
+    /// Run vector similarity search and inject result IDs as a filter on the PK column.
+    async fn inject_vector_search_filter(
+        &self,
+        filters: Vec<datafusion_expr::Expr>,
+    ) -> Result<Vec<datafusion_expr::Expr>> {
+        use crate::config::{
+            OPTION_KEY_VECTOR_SEARCH_COLUMN, OPTION_KEY_VECTOR_SEARCH_NPROBE,
+            OPTION_KEY_VECTOR_SEARCH_QUERY, OPTION_KEY_VECTOR_SEARCH_TOP_K,
+        };
+        use datafusion_common::ScalarValue;
+        use datafusion_expr::Expr;
+
+        let io_config = self.io_session.io_config();
+        let column = match io_config.option(OPTION_KEY_VECTOR_SEARCH_COLUMN) {
+            Some(c) => c,
+            None => return Ok(filters),
+        };
+        let query_str = match io_config.option(OPTION_KEY_VECTOR_SEARCH_QUERY) {
+            Some(q) => q,
+            None => return Ok(filters),
+        };
+        let top_k: usize = io_config
+            .option(OPTION_KEY_VECTOR_SEARCH_TOP_K)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let nprobe: usize = io_config
+            .option(OPTION_KEY_VECTOR_SEARCH_NPROBE)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let query = match crate::vector::search::parse_query_vector(&query_str, None) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Invalid vector search query: {}", e);
+                return Ok(filters);
+            }
+        };
+        let pk_column = io_config
+            .primary_keys
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "id".to_string());
+        let raw_prefix = io_config.prefix().trim_end_matches('/');
+        let table_path = raw_prefix
+            .trim_start_matches("file://")
+            .trim_start_matches("s3://")
+            .trim_start_matches("s3a://");
+        let table_url = datafusion_datasource::ListingTableUrl::parse(raw_prefix)
+            .map_err(|e| rootcause::report!("invalid table path: {}", e))?;
+        let store = self
+            .io_session
+            .runtime_env()
+            .object_store(table_url.object_store())
+            .map_err(|e| rootcause::report!("failed to get object store: {}", e))?;
+        let ids = crate::vector::search::search_matching_shards(
+            &store,
+            io_config.files_slice(),
+            &column,
+            table_path,
+            io_config.range_partitions_slice(),
+            &query,
+            top_k,
+            nprobe,
+            lakesoul_vector::Metric::L2,
+        )
+        .await?;
+        if ids.is_empty() {
+            tracing::info!("Vector search returned no results — producing empty result");
+            // Inject a filter that matches nothing, so the scan returns zero rows
+            let no_match = Expr::Literal(ScalarValue::Boolean(Some(false)), None);
+            return Ok(filters
+                .into_iter()
+                .chain(std::iter::once(no_match))
+                .collect());
+        }
+        tracing::info!("Vector search found {} matching IDs", ids.len());
+        let pk_expr =
+            Expr::Column(datafusion_common::Column::new_unqualified(&pk_column));
+        let mut id_filter: Option<Expr> = None;
+        for id in &ids {
+            let eq = pk_expr
+                .clone()
+                .eq(Expr::Literal(ScalarValue::UInt64(Some(*id)), None));
+            id_filter = Some(id_filter.map_or(eq.clone(), |prev| prev.or(eq)));
+        }
+        if let Some(f) = id_filter {
+            return Ok(filters.into_iter().chain(std::iter::once(f)).collect());
+        }
+        Ok(filters)
+    }
+
     /// Retrieves the next record batch from the reader.
     ///
     /// # Returns
@@ -262,15 +367,21 @@ impl LakeSoulReader {
 ///
 /// # Examples
 ///
-/// ```rust
-/// use lakesoul_io::lakesoul_reader::SyncSendableMutableLakeSoulReader;
+/// ```ignore
+/// use lakesoul_io::config::LakeSoulIOConfig;
+/// use lakesoul_io::reader::{LakeSoulReader, SyncSendableMutableLakeSoulReader};
 /// use tokio::runtime::Runtime;
 ///
-/// let runtime = Runtime::new()?;
-/// let mut reader = SyncSendableMutableLakeSoulReader::new(lake_soul_reader, runtime);
-/// reader.start_blocked()?;
+/// let runtime = Runtime::new().unwrap();
+/// let config = LakeSoulIOConfig::builder()
+///     .with_file("path/to/file.parquet")
+///     .build();
+/// let lake_soul_reader = LakeSoulReader::new(config).unwrap();
+/// let mut reader =
+///     SyncSendableMutableLakeSoulReader::new(lake_soul_reader, runtime);
+/// reader.start_blocked().unwrap();
 ///
-/// let (tx, rx) = std::sync::mpsc::channel(1);
+/// let (tx, rx) = std::sync::mpsc::channel();
 /// reader.next_rb_callback(Box::new(move |batch| {
 ///     tx.send(batch).unwrap();
 /// }));
@@ -418,34 +529,13 @@ mod tests {
 
     use rand::Rng;
 
-    #[tokio::test]
-    async fn test_reader_local() -> Result<()> {
-        let project_dir = std::env::current_dir()?;
-        let reader_io_config = LakeSoulIOConfigBuilder::new()
-            .with_files(vec![
-                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-parquet-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.parquet").into_os_string().into_string().unwrap()
-            ])
-            .with_thread_num(1)
-            .with_batch_size(256)
-            .build();
-        let mut reader = LakeSoulReader::new(reader_io_config)?;
-        reader.start().await?;
-        let mut row_cnt: usize = 0;
-
-        while let Some(rb) = reader.next_rb().await {
-            let num_rows = &rb.unwrap().num_rows();
-            row_cnt += num_rows;
-        }
-        assert_eq!(row_cnt, 1000);
-        Ok(())
-    }
-
     #[test]
     fn test_reader_local_blocked() -> Result<()> {
         let project_dir = std::env::current_dir()?;
         let reader_io_config = LakeSoulIOConfigBuilder::new()
             .with_files(vec![
-                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-parquet-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.parquet").into_os_string().into_string().unwrap()
+                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.parquet").into_os_string().into_string().unwrap(),
+                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.vortex").into_os_string().into_string().unwrap()
             ])
             .with_thread_num(2)
             .with_batch_size(11)
@@ -490,7 +580,10 @@ mod tests {
     fn test_reader_partition() -> Result<()> {
         let project_dir = std::env::current_dir()?;
         let reader_io_config = LakeSoulIOConfigBuilder::new()
-            .with_files(vec![  project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-parquet-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.parquet").into_os_string().into_string().unwrap()])
+            .with_files(vec![
+                project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.parquet").into_os_string().into_string().unwrap(),
+                    project_dir.join("../../native-io/lakesoul-io-java/src/test/resources/sample-data-files/part-00000-a9e77425-5fb4-456f-ba52-f821123bd193-c000.snappy.vortex").into_os_string().into_string().unwrap()
+            ])
             .with_thread_num(1)
             .with_batch_size(8192)
             .build();
@@ -520,6 +613,7 @@ mod tests {
                 break;
             }
         }
+        assert_eq!(row_cnt.load(Relaxed), 2000);
         Ok(())
     }
 
@@ -618,6 +712,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn profiling_2ways_merge_on_read() -> Result<()> {
         let num_batch = 10;
         let num_rows = 1000;

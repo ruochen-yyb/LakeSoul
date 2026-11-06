@@ -12,11 +12,12 @@ import com.dmetasoul.lakesoul.spark.clean.CleanOldCompaction.{cleanOldCommitOpDi
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.PredicateHelper
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LakeSoulFileWriter.{MAX_FILE_SIZE_KEY, SNAPPY_COMPRESS_RATIO}
 import org.apache.spark.sql.execution.datasources.v2.merge.MergeDeltaParquetScan
-import org.apache.spark.sql.execution.datasources.v2.parquet.{NativeParquetScan, ParquetScan}
+import org.apache.spark.sql.execution.datasources.v2.parquet.{NativeScan, ParquetScan}
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2ScanRelation}
 import org.apache.spark.sql.functions.expr
 import org.apache.spark.sql.lakesoul.catalog.LakeSoulTableV2
@@ -96,7 +97,7 @@ case class CompactionCommand(snapshotManagement: SnapshotManagement,
     })
 
     val scan = table.newScanBuilder(option).build()
-    val newReadFiles = if (scan.isInstanceOf[ParquetScan] || scan.isInstanceOf[NativeParquetScan]) {
+    val newReadFiles = if (scan.isInstanceOf[ParquetScan] || scan.isInstanceOf[NativeScan]) {
       fileIndex.getFileInfo(Nil)
     } else {
       scan.asInstanceOf[MergeDeltaParquetScan].newFileIndex.getFileInfo(Nil)
@@ -108,7 +109,7 @@ case class CompactionCommand(snapshotManagement: SnapshotManagement,
 
     val v2Relation = DataSourceV2Relation(
       table,
-      tableSchemaWithoutPartitions.toAttributes,
+      DataTypeUtils.toAttributes(tableSchemaWithoutPartitions),
       None,
       None,
       option
@@ -119,7 +120,7 @@ case class CompactionCommand(snapshotManagement: SnapshotManagement,
       DataSourceV2ScanRelation(
         v2Relation,
         scan,
-        tableSchemaWithoutPartitions.toAttributes
+        DataTypeUtils.toAttributes(tableSchemaWithoutPartitions)
       )
     )
 
@@ -225,6 +226,8 @@ case class CompactionCommand(snapshotManagement: SnapshotManagement,
       val compactDataCommitInfoId = UUID.randomUUID
       val compactDataCommitInfo =
         DataCommitInfo.newBuilder(allDataCommitInfo.head)
+          .setTableId(tc.tableInfo.table_id)
+          .setPartitionDesc(sourcePartition.range_value)
           .setCommitId(DBUtil.toProtoUuid(compactDataCommitInfoId))
           .clearFileOps
           .addAllFileOps(allDataCommitInfo.flatMap(_.getFileOpsList.asScala).asJava)

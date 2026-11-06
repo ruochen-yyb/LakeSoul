@@ -4,6 +4,7 @@
 
 use crate::physical_plan::merge::sorted::cursor::CursorValues;
 use arrow_array::RecordBatch;
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 
 pub struct BatchRange<C: CursorValues> {
@@ -194,6 +195,13 @@ impl<C: CursorValues> BatchRange<C> {
     }
 }
 
+pub struct InProgressRow {
+    pub(crate) range_idx: usize,
+    pub(crate) row_idx: usize,
+}
+
+pub type InProgressPkGroup = SmallVec<[InProgressRow; 4]>;
+
 impl<C: CursorValues> PartialEq for BatchRange<C> {
     fn eq(&self, other: &Self) -> bool {
         C::eq(&self.cursor, self.begin_row, &other.cursor, other.begin_row)
@@ -214,11 +222,6 @@ impl<C: CursorValues> Ord for BatchRange<C> {
             .then_with(|| self.stream_idx.cmp(&other.stream_idx))
             .then_with(|| self.batch_idx.cmp(&other.batch_idx))
     }
-}
-
-pub struct InProgressRow {
-    pub(crate) range_idx: usize,
-    pub(crate) row_idx: usize,
 }
 
 #[cfg(test)]
@@ -255,7 +258,7 @@ mod tests {
 
         let pool = Arc::new(GreedyMemoryPool::new(1024 * 1024)) as _;
         let consumer = MemoryConsumer::new("batch_range_test").register(&pool);
-        let mut reservation = consumer.new_empty();
+        let reservation = consumer.new_empty();
         reservation.try_grow(rows.size()).unwrap();
         let cursor = RowValues::new(rows, converter, reservation);
         let end_row_for_merge = if batch.num_rows() == 0 {

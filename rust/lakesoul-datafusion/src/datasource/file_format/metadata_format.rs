@@ -4,7 +4,6 @@
 
 //! The [`datafusion::datasource::file_format::FileFormat`] implementation for the LakeSoul Parquet format with metadata.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use datafusion::datasource::file_format::file_compression_type::FileCompressionT
 use datafusion::datasource::file_format::parquet::ParquetFormatFactory;
 use datafusion::datasource::listing::ListingOptions;
 use datafusion::datasource::physical_plan::FileSource;
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -130,14 +130,25 @@ impl LakeSoulMetaDataParquetFormat {
             .await?,
         )))
     }
+
+    fn needs_output_projection(
+        target_schema: &SchemaRef,
+        merged_schema: &SchemaRef,
+    ) -> bool {
+        if target_schema.fields().len() < merged_schema.fields().len() {
+            return true;
+        }
+
+        target_schema
+            .fields()
+            .iter()
+            .zip(merged_schema.fields().iter())
+            .any(|(target, merged)| target.name() != merged.name())
+    }
 }
 
 #[async_trait]
 impl FileFormat for LakeSoulMetaDataParquetFormat {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn get_ext(&self) -> String {
         ParquetFormatFactory::new().get_ext()
     }
@@ -199,13 +210,15 @@ impl FileFormat for LakeSoulMetaDataParquetFormat {
             &conf,
         );
 
-        let table_schema = conf.table_schema.table_schema().clone();
+        let table_schema = Arc::clone(conf.file_source.table_schema().table_schema());
 
         // lakesoul only use column indices
-        let projection_indices = conf
-            .projection_exprs
-            .as_ref()
-            .map(|expr| expr.ordered_column_indices());
+        let projection_indices = conf.file_source.projection().as_ref().map(|p| {
+            p.ordered_column_indices()
+                .into_iter()
+                .filter(|&i| i < table_schema.fields().len())
+                .collect::<Vec<_>>()
+        });
 
         let target_schema = project_schema(&table_schema, projection_indices.as_ref())?;
 
@@ -319,13 +332,13 @@ impl FileFormat for LakeSoulMetaDataParquetFormat {
             exec
         };
 
-        if target_schema.fields().len() < merged_schema.fields().len() {
+        if Self::needs_output_projection(&target_schema, &merged_schema) {
             let mut projection_expr = vec![];
             for field in target_schema.fields() {
                 projection_expr.push((
                     datafusion::physical_expr::expressions::col(
                         field.name(),
-                        &merged_schema,
+                        exec.schema().as_ref(),
                     )?,
                     field.name().clone(),
                 ));
@@ -366,10 +379,8 @@ impl FileFormat for LakeSoulMetaDataParquetFormat {
         ) as _)
     }
 
-    fn file_source(&self) -> Arc<dyn FileSource> {
-        self.parquet_format
-            .file_source()
-            .with_statistics(Statistics::default())
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
+        self.parquet_format.file_source(table_schema)
     }
 }
 
@@ -394,7 +405,7 @@ pub struct LakeSoulHashSinkExec {
     range_partitions: Arc<Vec<String>>,
 
     /// The properties of the plan.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl Debug for LakeSoulHashSinkExec {
@@ -420,12 +431,12 @@ impl LakeSoulHashSinkExec {
             table_info,
             metadata_client,
             range_partitions,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(make_sink_schema()),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 
@@ -607,17 +618,12 @@ impl ExecutionPlan for LakeSoulHashSinkExec {
         "LakeSoulHashSinkExec"
     }
 
-    /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Get the schema for this execution plan
     fn schema(&self) -> SchemaRef {
         self.sink_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -761,4 +767,26 @@ fn make_sink_schema() -> SchemaRef {
         Field::new("count", DataType::UInt64, false),
         Field::new("msg", DataType::Utf8, false),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_width_different_order_still_needs_projection() {
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int32, true),
+            Field::new("c2", DataType::Int32, true),
+        ]));
+        let merged_schema = Arc::new(Schema::new(vec![
+            Field::new("c2", DataType::Int32, true),
+            Field::new("c1", DataType::Int32, true),
+        ]));
+
+        assert!(LakeSoulMetaDataParquetFormat::needs_output_projection(
+            &target_schema,
+            &merged_schema,
+        ));
+    }
 }

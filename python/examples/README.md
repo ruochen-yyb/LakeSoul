@@ -12,7 +12,7 @@ docker compose up -d
 ### Pull spark image
 
 ```bash
-docker pull swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/bitnami/spark:3.3.1
+docker pull swr.cn-southwest-2.myhuaweicloud.com/dmetasoul-repo/spark:3.5.8-py310-hadoop334
 ```
 
 ### Download LakeSoul release jar
@@ -35,8 +35,8 @@ source lakesoul_env.sh
 ```
 The content of `lakesoul_env.sh` is the following:
 ```shell
-export AWS_SECRET_ACCESS_KEY=minioadmin1
-export AWS_ACCESS_KEY_ID=minioadmin1
+export AWS_SECRET_ACCESS_KEY=rustfsadmin
+export AWS_ACCESS_KEY_ID=rustfsadmin
 export AWS_ENDPOINT=http://localhost:9000
 
 export LAKESOUL_PG_URL=jdbc:postgresql://localhost:5432/lakesoul_test?stringtype=unspecified

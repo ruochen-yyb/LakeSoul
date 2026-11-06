@@ -13,6 +13,7 @@ import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.arrow.ArrowUtils
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.lakesoul.LakeSoulOptions.HASH_PARTITIONS
 
 
@@ -44,7 +45,7 @@ trait ImplicitMetadataOperation extends Logging {
       if (colMatches.length > 1) {
         throw LakeSoulErrors.ambiguousPartitionColumnException(columnName, colMatches)
       } else if (colMatches.isEmpty) {
-        throw LakeSoulErrors.partitionColumnNotFoundException(columnName, schema.toAttributes)
+        throw LakeSoulErrors.partitionColumnNotFoundException(columnName, DataTypeUtils.toAttributes(schema))
       }
       colMatches.head.name
     }
@@ -147,7 +148,7 @@ trait ImplicitMetadataOperation extends Logging {
           namespace = table_info.namespace,
           table_path_s = Option(SparkUtil.makeQualifiedTablePath(new Path(table_info.table_path_s.get)).toUri.toString),
           table_id = table_info.table_id,
-          table_schema = ArrowUtils.toArrowSchema(dataSchema).toJson,
+          table_schema = ArrowUtils.toMetadataArrowSchema(dataSchema).toJson,
           range_column = normalizedRangePartitionCols.mkString(LAKESOUL_RANGE_PARTITION_SPLITTER),
           hash_column = hash_column,
           bucket_num = realHashBucketNum,
@@ -156,14 +157,15 @@ trait ImplicitMetadataOperation extends Logging {
     }
     else if (isOverwriteMode && canOverwriteSchema && isNewSchema) {
       val newTableInfo = tc.tableInfo.copy(
-        table_schema = ArrowUtils.toArrowSchema(dataSchema).toJson
+        table_schema = ArrowUtils.toMetadataArrowSchema(dataSchema).toJson
       )
 
       tc.updateTableInfo(newTableInfo)
     } else if (isNewSchema && canMergeSchema) {
       logInfo(s"New merged schema: ${mergedSchema.treeString}")
 
-      tc.updateTableInfo(tc.tableInfo.copy(table_schema = ArrowUtils.toArrowSchema(mergedSchema).toJson))
+      tc.updateTableInfo(tc.tableInfo.copy(
+        table_schema = ArrowUtils.toMetadataArrowSchema(mergedSchema).toJson))
     } else if (isNewSchema) {
       val errorBuilder = new MetadataMismatchErrorBuilder
       if (isNewSchema) {

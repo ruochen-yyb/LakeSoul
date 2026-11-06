@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: LakeSoul Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::Arc;
 use std::thread;
 use std::{ops::Range, time::Instant};
@@ -6,9 +10,9 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    path::Path,
+    Attributes, CopyOptions, Error, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, path::Path,
 };
 
 use super::{paging::PageCache, stats::CacheStats};
@@ -148,35 +152,56 @@ impl<C: PageCache> ObjectStore for ReadThroughCache<C> {
         self.inner.put_multipart_opts(location, _opts).await
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        let meta = self.head(location).await?;
-        let file_size = meta.size;
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        if options.version.is_some() {
+            return self.inner.get_opts(location, options).await;
+        }
+
+        let meta = self.cache.head(location, self.inner.head(location)).await?;
+        options.check_preconditions(&meta)?;
+
+        if options.head {
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(stream::empty().boxed()),
+                meta,
+                range: 0..0,
+                attributes: Attributes::default(),
+            });
+        }
+
+        let range = match options.range {
+            Some(range) => {
+                range.as_range(meta.size).map_err(|source| Error::Generic {
+                    store: "ReadThroughCache",
+                    source: Box::new(source),
+                })?
+            }
+            None => 0..meta.size,
+        };
         let page_size = self.cache.page_size();
         let inner = self.inner.clone();
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let location = location.clone();
         let parallelism = self.parallelism;
+        let range_start = range.start as usize;
+        let range_end = range.end as usize;
+        let first_page_start = (range_start / page_size) * page_size;
 
         // TODO: This might yield too many small reads.
-        let s = stream::iter((0..file_size).step_by(page_size))
+        let s = stream::iter((first_page_start..range_end).step_by(page_size))
             .map(move |offset| {
                 let loc = location.clone();
                 let store = inner.clone();
                 let stats = stats.clone();
                 let c = cache.clone();
                 let page_size = cache.page_size();
+                let chunk_start = std::cmp::max(offset, range_start);
+                let chunk_end = std::cmp::min(offset + page_size, range_end);
 
                 async move {
-                    get_range(
-                        store,
-                        c,
-                        stats,
-                        &loc,
-                        offset as usize..offset as usize + page_size,
-                        parallelism,
-                    )
-                    .await
+                    get_range(store, c, stats, &loc, chunk_start..chunk_end, parallelism)
+                        .await
                 }
             })
             .buffered(self.parallelism)
@@ -186,38 +211,28 @@ impl<C: PageCache> ObjectStore for ReadThroughCache<C> {
         Ok(GetResult {
             payload,
             meta: meta.clone(),
-            range: 0..meta.size,
+            range,
             attributes: Attributes::default(),
         })
     }
 
-    async fn get_opts(
+    fn delete_stream(
         &self,
-        _location: &Path,
-        _options: GetOptions,
-    ) -> Result<GetResult> {
-        todo!()
-    }
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let cache = self.cache.clone();
+        let invalidated = locations
+            .then(move |location| {
+                let cache = cache.clone();
+                async move {
+                    let location = location?;
+                    cache.invalidate(&location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed();
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        get_range(
-            self.inner.clone(),
-            self.cache.clone(),
-            self.stats.clone(),
-            location,
-            range.start as usize..range.end as usize,
-            self.parallelism,
-        )
-        .await
-    }
-
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        self.cache.head(location, self.inner.head(location)).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.invalidate(location).await?;
-        self.inner.delete(location).await
+        self.inner.delete_stream(invalidated)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -228,14 +243,14 @@ impl<C: PageCache> ObjectStore for ReadThroughCache<C> {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> Result<()> {
         self.invalidate(to).await?;
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.invalidate(to).await?;
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -247,7 +262,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_end_of_file() {
-        let cache = Arc::new(DiskCache::new(64 * 1024 * 1024, 16 * 1024));
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(DiskCache::with_path(
+            64 * 1024 * 1024,
+            16 * 1024,
+            cache_dir.path().join("cache"),
+        ));
         let store = Arc::new(object_store::local::LocalFileSystem::new());
         let cache = Arc::new(ReadThroughCache::new(store, cache));
 

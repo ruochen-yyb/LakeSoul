@@ -1,163 +1,152 @@
-# SPDX-FileCopyrightText: 2023 LakeSoul Contributors
+# SPDX-FileCopyrightText: 2023,2026 LakeSoul Contributors
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
+
+import pyarrow as pa
+import pyarrow.dataset as ds
 import ray
-
-from typing import List
-
-from ray.data.datasource.datasource import Reader
-from ray.data.datasource.datasource import ReadTask
-from ray.data.datasource.datasource import Datasource
+from ray.data import Dataset
 from ray.data.block import BlockMetadata
+from ray.data.datasource.datasource import Datasource, ReadTask
 
-from ..metadata.meta_ops import (
-    get_arrow_schema_by_table_name,
-    get_data_files_and_pks_by_table_name,
-)
+from lakesoul.arrow import LakeSoulScanConfig, lakesoul_dataset
+from lakesoul.arrow.dataset import schema_projection
+
+if TYPE_CHECKING:
+    from lakesoul.catalog import LakeSoulScan
 
 
-def _read_lakesoul_data_file(
-    table_name,
-    batch_size=16,
-    thread_count=1,
-    rank=None,
-    world_size=None,
-    partitions=None,
-    retain_partition_columns=False,
-    namespace="default",
-    object_store_configs={},
-):
-    import pyarrow as pa
-    from ..arrow import lakesoul_dataset
+def _cache_dataset_schema(dataset: Dataset, arrow_schema: pa.Schema) -> None:
+    plan = getattr(dataset, "_plan", None)
+    if plan is None:
+        return
 
-    arrow_dataset = lakesoul_dataset(
-        table_name,
-        batch_size=batch_size,
-        thread_count=thread_count,
-        rank=rank,
-        world_size=world_size,
-        partitions=partitions,
-        retain_partition_columns=retain_partition_columns,
-        namespace=namespace,
-        object_store_configs=object_store_configs,
-    )
-    for batch in arrow_dataset.to_batches():
+    cache_schema = getattr(plan, "cache_schema", None)
+    if cache_schema is not None:
+        cache_schema(arrow_schema)
+        return
+
+    cache = getattr(plan, "_cache", None)
+    logical_plan = getattr(dataset, "_logical_plan", None)
+    dag = getattr(logical_plan, "dag", None)
+    set_schema = getattr(cache, "set_schema", None)
+    if set_schema is not None and dag is not None:
+        set_schema(dag, arrow_schema)
+
+
+def _read_lakesoul_scan(
+    scan_config: LakeSoulScanConfig,
+    columns: tuple[str, ...] | None,
+    filter: ds.Expression | None,
+) -> Iterator[pa.Table]:
+    arrow_dataset = lakesoul_dataset(scan_config)
+    for batch in arrow_dataset.to_batches(
+        columns=list(columns) if columns is not None else None,
+        filter=filter,
+    ):
         yield pa.Table.from_batches([batch])
 
 
-class _LakeSoulDatasourceReader(Reader):
-    def __init__(
-        self,
-        table_name,
-        batch_size=16,
-        thread_count=1,
-        partitions=None,
-        retain_partition_columns=False,
-        namespace="default",
-    ):
-        self._table_name = table_name
-        self._batch_size = batch_size
-        self._thread_count = thread_count
-        self._partitions = partitions
-        self._retain_partition_columns = retain_partition_columns
-        self._namespace = namespace
-
-    def estimate_inmemory_data_size(self):
-        return None
-
-    def _get_table_metadata(self):
-        data_files, pk_cols = get_data_files_and_pks_by_table_name(
-            table_name=self._table_name,
-            partitions=self._partitions or {},
-            namespace=self._namespace,
-        )
-        arrow_schema = get_arrow_schema_by_table_name(
-            table_name=self._table_name,
-            namespace=self._namespace,
-            exclude_partition=not self._retain_partition_columns,
-        )
-        table_metadata = data_files, arrow_schema
-        return table_metadata
-
-    def get_read_tasks(self, parallelism: int) -> List[ReadTask]:
-        read_tasks = []
-        table_metadata = self._get_table_metadata()
-        data_files, arrow_schema = table_metadata
-        metadata = BlockMetadata(
-            num_rows=None,
-            size_bytes=None,
-            schema=arrow_schema,
-            input_files=None,
-            exec_stats=None,
-        )
-        for index, _data_file in enumerate(data_files):
-            read_task = ReadTask(
-                lambda table_name=self._table_name,
-                batch_size=self._batch_size,
-                thread_count=self._thread_count,
-                rank=index,
-                world_size=len(data_files),
-                partitions=self._partitions,
-                retain_partition_columns=self._retain_partition_columns,
-                namespace=self._namespace: _read_lakesoul_data_file(
-                    table_name=table_name,
-                    batch_size=batch_size,
-                    thread_count=thread_count,
-                    rank=rank,
-                    world_size=world_size,
-                    partitions=partitions,
-                    retain_partition_columns=retain_partition_columns,
-                    namespace=namespace,
-                ),
-                metadata,
-            )
-            read_tasks.append(read_task)
-        return read_tasks
+def _read_empty_lakesoul_table(arrow_schema: pa.Schema) -> Iterator[pa.Table]:
+    yield pa.Table.from_batches([], schema=arrow_schema)
 
 
 class LakeSoulDatasource(Datasource):
-    def create_reader(
+    def __init__(
         self,
-        table_name,
-        batch_size=16,
-        thread_count=1,
-        partitions=None,
-        retain_partition_columns=False,
-        namespace="default",
-    ) -> Reader:
-        return _LakeSoulDatasourceReader(
-            table_name=table_name,
-            batch_size=batch_size,
-            thread_count=thread_count,
-            partitions=partitions,
-            retain_partition_columns=retain_partition_columns,
-            namespace=namespace,
+        scan_config: LakeSoulScanConfig,
+        *,
+        columns: tuple[str, ...] | None = None,
+        filter: ds.Expression | None = None,
+    ) -> None:
+        self._scan_config = scan_config
+        self._columns = columns
+        self._filter = filter
+        self._schema = (
+            schema_projection(scan_config.schema, list(columns))
+            if columns is not None
+            else scan_config.schema
         )
 
-    def do_write(self, *args, **kwargs):
-        message = "write to LakeSoul is not implemented yet"
-        raise NotImplementedError(message)
+    def estimate_inmemory_data_size(self) -> int | None:
+        return None
+
+    def get_read_tasks(
+        self,
+        parallelism: int,
+        per_task_row_limit: int | None = None,
+        data_context: Any | None = None,
+    ) -> list[ReadTask]:
+        del parallelism, data_context
+
+        scan_partitions = [
+            scan_partition
+            for scan_partition in self._scan_config.scan_partitions
+            if scan_partition.files
+        ]
+        if not scan_partitions:
+            metadata = BlockMetadata(
+                num_rows=0,
+                size_bytes=0,
+                input_files=None,
+                exec_stats=None,
+            )
+            return [
+                ReadTask(
+                    lambda schema=self._schema: _read_empty_lakesoul_table(schema),
+                    metadata,
+                    schema=self._schema,
+                    per_task_row_limit=per_task_row_limit,
+                )
+            ]
+
+        read_tasks: list[ReadTask] = []
+        for scan_partition in scan_partitions:
+            task_config = replace(
+                self._scan_config,
+                scan_partitions=(scan_partition,),
+                rank=None,
+                world_size=None,
+            )
+            metadata = BlockMetadata(
+                num_rows=None,
+                size_bytes=None,
+                input_files=tuple(scan_partition.files),
+                exec_stats=None,
+            )
+            read_tasks.append(
+                ReadTask(
+                    lambda config=task_config, columns=self._columns, filter=self._filter: (
+                        _read_lakesoul_scan(
+                            config,
+                            columns,
+                            filter,
+                        )
+                    ),
+                    metadata,
+                    schema=self._schema,
+                    per_task_row_limit=per_task_row_limit,
+                )
+            )
+        return read_tasks
 
 
-def read_lakesoul(
-    table_name,
-    batch_size=16,
-    thread_count=1,
-    partitions=None,
-    retain_partition_columns=False,
-    namespace="default",
-):
-    ds = ray.data.read_datasource(
-        LakeSoulDatasource(),
-        table_name=table_name,
-        batch_size=batch_size,
-        thread_count=thread_count,
-        partitions=partitions,
-        retain_partition_columns=retain_partition_columns,
-        namespace=namespace,
+def read_lakesoul(scan: LakeSoulScan) -> Dataset:
+    scan_config = scan.to_scan_config()
+    datasource = LakeSoulDatasource(
+        scan_config,
+        columns=scan.columns,
+        filter=scan.expression,
     )
-    return ds
+    dataset = ray.data.read_datasource(datasource)
+    _cache_dataset_schema(dataset, datasource._schema)
+    return dataset
 
 
-ray.data.read_lakesoul = read_lakesoul
+setattr(ray.data, "read_lakesoul", read_lakesoul)

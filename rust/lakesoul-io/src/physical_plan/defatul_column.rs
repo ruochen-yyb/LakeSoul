@@ -4,8 +4,8 @@
 
 //! Implementation of the default column operation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::{any::Any, collections::HashMap};
 
 use arrow_schema::SchemaRef;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
@@ -27,7 +27,7 @@ pub struct DefaultColumnExec {
     input: Arc<dyn ExecutionPlan>,
     target_schema: SchemaRef,
     default_column_value: Arc<HashMap<String, String>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DefaultColumnExec {
@@ -40,12 +40,12 @@ impl DefaultColumnExec {
             input,
             target_schema: target_schema.clone(),
             default_column_value,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(target_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 }
@@ -87,15 +87,11 @@ impl ExecutionPlan for DefaultColumnExec {
         "DefaultColumnExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.target_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
